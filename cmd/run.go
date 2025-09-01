@@ -625,23 +625,6 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 	setupStart := time.Now()
 
 	for i := 0; i < clientCount; i++ {
-		var client CacheClient
-		var err error
-
-		if measureSetup {
-			// Create cache client with setup time measurement
-			client, err = createAndTestCacheClient(cacheType, cmd, stats)
-			if err != nil {
-				log.Fatalf("Failed to create and test cache client for worker %d: %v", i, err)
-			}
-		} else {
-			// Create cache client without measurement
-			client, err = createCacheClientForRun(cacheType, cmd)
-			if err != nil {
-				log.Fatalf("Failed to create cache client for worker %d: %v", i, err)
-			}
-		}
-
 		// Create rate limiter for this client if specified
 		var limiter *rate.Limiter
 		if rps > 0 {
@@ -650,8 +633,10 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 		}
 
 		wg.Add(1)
-		go runWorker(ctx, &wg, i, client, totalKeys, zipfExp, generator, stats,
-			setRatio, getRatio, keyPrefix, keyMin, limiter, timeoutSeconds, verbose)
+		// Let each worker create its own connection in parallel
+		go runWorkerWithConnectionCreation(ctx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
+			generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
+			timeoutSeconds, measureSetup, verbose)
 	}
 
 	totalSetupTime := time.Since(setupStart)
@@ -696,13 +681,19 @@ func runDynamicWorkload(cmd *cobra.Command, trafficPatternFile, cacheType string
 	}
 
 	fmt.Printf("Starting dynamic workload with %d traffic configurations...\n", len(trafficConfigs))
+	maxClients := 0
 	for i, config := range trafficConfigs {
+		if config.Clients > maxClients {
+			maxClients = config.Clients
+		}
 		qpsStr := "unlimited"
 		if config.QPS != -1 {
 			qpsStr = fmt.Sprintf("%d", config.QPS)
 		}
 		fmt.Printf("  %d. Time %ds: %d clients, %s QPS\n", i+1, config.TimeSeconds, config.Clients, qpsStr)
 	}
+	fmt.Printf("\nMax clients planned: %d\n", maxClients)
+	fmt.Printf("Note: Each client creates a TCP connection. Ensure system limits allow this.\n")
 	fmt.Println()
 
 	// Calculate total test time
@@ -735,6 +726,16 @@ func runWorker(ctx context.Context, wg *sync.WaitGroup, workerID int, client Cac
 
 	defer wg.Done()
 	defer client.Close()
+
+	runWorkerInternal(ctx, workerID, client, totalKeys, zipfExp, generator, stats,
+		setRatio, getRatio, keyPrefix, keyMin, limiter, timeoutSeconds, verbose)
+}
+
+// runWorkerInternal contains the actual worker logic without WaitGroup management
+func runWorkerInternal(ctx context.Context, workerID int, client CacheClient,
+	totalKeys int, zipfExp float64, generator *DataGenerator, stats *WorkloadStats,
+	setRatio, getRatio int, keyPrefix string, keyMin int,
+	limiter *rate.Limiter, timeoutSeconds int, verbose bool) {
 
 	// Create a worker-specific Zipf generator with unique seed to ensure different key patterns
 	seed := time.Now().UnixNano() + int64(workerID*1000)
@@ -818,6 +819,40 @@ func runWorker(ctx context.Context, wg *sync.WaitGroup, workerID int, client Cac
 	}
 }
 
+// runWorkerWithConnectionCreation creates its own connection and then runs the worker
+func runWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, workerID int,
+	cacheType string, cmd *cobra.Command, totalKeys int, zipfExp float64,
+	generator *DataGenerator, stats *WorkloadStats, setRatio, getRatio int,
+	keyPrefix string, keyMin int, limiter *rate.Limiter, timeoutSeconds int,
+	measureSetup, verbose bool) {
+
+	defer wg.Done()
+
+	// Create cache client in this goroutine (parallel connection creation)
+	var client CacheClient
+	var err error
+
+	if measureSetup {
+		client, err = createAndTestCacheClient(cacheType, cmd, stats)
+	} else {
+		client, err = createCacheClientForRun(cacheType, cmd)
+	}
+
+	if err != nil {
+		// Always log connection failures as they're critical
+		log.Printf("Worker %d: Failed to create client: %v", workerID, err)
+		return
+	}
+
+	if verbose {
+		log.Printf("Worker %d: Successfully created client connection", workerID)
+	}
+
+	// Now run the normal worker routine (but don't call wg.Done() again)
+	runWorkerInternal(ctx, workerID, client, totalKeys, zipfExp, generator, stats,
+		setRatio, getRatio, keyPrefix, keyMin, limiter, timeoutSeconds, verbose)
+}
+
 // manageTrafficPattern manages dynamic client scaling and QPS changes
 func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheType string,
 	cmd *cobra.Command, generator *DataGenerator, stats *WorkloadStats,
@@ -828,7 +863,7 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 	var wg sync.WaitGroup
 	startTime := time.Now()
 
-	for _, config := range configs {
+	for i, config := range configs {
 		// Wait until it's time for this configuration
 		targetTime := time.Duration(config.TimeSeconds) * time.Second
 		elapsed := time.Since(startTime)
@@ -836,6 +871,7 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 			select {
 			case <-time.After(targetTime - elapsed):
 			case <-ctx.Done():
+				fmt.Printf("\nTraffic manager: Context cancelled while waiting for config %d\n", i+1)
 				return
 			}
 		}
@@ -843,55 +879,61 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 		// Start new time block tracking
 		stats.StartTimeBlock(config)
 
-		if verbose {
-			qpsStr := "unlimited"
-			if config.QPS != -1 {
-				qpsStr = fmt.Sprintf("%d", config.QPS)
-			}
-			fmt.Printf("Time %ds: Scaling to %d clients, %s QPS\n",
-				config.TimeSeconds, config.Clients, qpsStr)
+		qpsStr := "unlimited"
+		if config.QPS != -1 {
+			qpsStr = fmt.Sprintf("%d", config.QPS)
 		}
+
+		// Always log scaling events (not just in verbose mode)
+		fmt.Printf("\nTime %ds: Scaling to %d clients, %s QPS (config %d/%d)\n",
+			config.TimeSeconds, config.Clients, qpsStr, i+1, len(configs))
 
 		// Stop excess workers if scaling down
 		currentWorkers := len(activeWorkers)
 		if config.Clients < currentWorkers {
+			stoppedWorkers := currentWorkers - config.Clients
+			fmt.Printf("  Stopping %d workers (scaling down from %d to %d)\n",
+				stoppedWorkers, currentWorkers, config.Clients)
 			for i := config.Clients; i < currentWorkers; i++ {
 				activeWorkers[i]() // Cancel the worker
 			}
 			activeWorkers = activeWorkers[:config.Clients]
 		}
 
-		// Start new workers if scaling up
-		for i := currentWorkers; i < config.Clients; i++ {
-			// Create cache client
-			var client CacheClient
-			var err error
+		// Start new workers if scaling up (create connections in parallel)
+		newWorkers := config.Clients - currentWorkers
+		if newWorkers > 0 {
+			fmt.Printf("  Starting %d new workers (scaling up from %d to %d)\n",
+				newWorkers, currentWorkers, config.Clients)
 
-			if measureSetup {
-				client, err = createAndTestCacheClient(cacheType, cmd, stats)
-			} else {
-				client, err = createCacheClientForRun(cacheType, cmd)
+			for i := currentWorkers; i < config.Clients; i++ {
+				// Check if context is still valid
+				select {
+				case <-ctx.Done():
+					fmt.Printf("  Context cancelled while starting worker %d\n", i)
+					return
+				default:
+				}
+
+				// Create rate limiter
+				var limiter *rate.Limiter
+				if config.QPS > 0 {
+					clientRPS := float64(config.QPS) / float64(config.Clients)
+					limiter = rate.NewLimiter(rate.Limit(clientRPS), 1)
+				}
+
+				// Create worker context
+				workerCtx, workerCancel := context.WithCancel(ctx)
+				activeWorkers = append(activeWorkers, workerCancel)
+
+				wg.Add(1)
+				// Pass connection creation parameters to worker - let it create connection in parallel
+				go runWorkerWithConnectionCreation(workerCtx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
+					generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
+					timeoutSeconds, measureSetup, verbose)
 			}
 
-			if err != nil {
-				log.Printf("Failed to create client %d: %v", i, err)
-				continue
-			}
-
-			// Create rate limiter
-			var limiter *rate.Limiter
-			if config.QPS > 0 {
-				clientRPS := float64(config.QPS) / float64(config.Clients)
-				limiter = rate.NewLimiter(rate.Limit(clientRPS), 1)
-			}
-
-			// Create worker context
-			workerCtx, workerCancel := context.WithCancel(ctx)
-			activeWorkers = append(activeWorkers, workerCancel)
-
-			wg.Add(1)
-			go runWorker(workerCtx, &wg, i, client, totalKeys, zipfExp, generator, stats,
-				setRatio, getRatio, keyPrefix, keyMin, limiter, timeoutSeconds, verbose)
+			fmt.Printf("  Successfully initiated %d new workers\n", newWorkers)
 		}
 	}
 
