@@ -342,7 +342,22 @@ type SystemStats struct {
 	MemoryUsedMB  float64
 	MemoryTotalMB float64
 	CPUPercent    float64
+	NetworkRxMBps float64 // Network receive MB/s
+	NetworkTxMBps float64 // Network transmit MB/s
+	NetworkRxPPS  float64 // Network receive packets/s
+	NetworkTxPPS  float64 // Network transmit packets/s
 }
+
+// NetworkStats holds network interface statistics
+type NetworkStats struct {
+	RxBytes   uint64
+	TxBytes   uint64
+	RxPackets uint64
+	TxPackets uint64
+	Timestamp time.Time
+}
+
+var lastNetworkStats *NetworkStats
 
 // getSystemStats returns current system resource usage (lightweight)
 func getSystemStats() SystemStats {
@@ -383,7 +398,98 @@ func getSystemStats() SystemStats {
 		}
 	}
 
+	// Get network statistics
+	networkStats := getNetworkStats()
+	if networkStats != nil {
+		stats.NetworkRxMBps = networkStats.NetworkRxMBps
+		stats.NetworkTxMBps = networkStats.NetworkTxMBps
+		stats.NetworkRxPPS = networkStats.NetworkRxPPS
+		stats.NetworkTxPPS = networkStats.NetworkTxPPS
+	}
+
 	return stats
+}
+
+// getNetworkStats returns network bandwidth and PPS statistics
+func getNetworkStats() *SystemStats {
+	currentStats := readNetworkStats()
+	if currentStats == nil || lastNetworkStats == nil {
+		lastNetworkStats = currentStats
+		return nil
+	}
+
+	// Calculate time difference
+	timeDiff := currentStats.Timestamp.Sub(lastNetworkStats.Timestamp).Seconds()
+	if timeDiff <= 0 {
+		return nil
+	}
+
+	// Calculate bandwidth (bytes/sec -> MB/s)
+	rxMBps := float64(currentStats.RxBytes-lastNetworkStats.RxBytes) / timeDiff / (1024 * 1024)
+	txMBps := float64(currentStats.TxBytes-lastNetworkStats.TxBytes) / timeDiff / (1024 * 1024)
+
+	// Calculate packets per second
+	rxPPS := float64(currentStats.RxPackets-lastNetworkStats.RxPackets) / timeDiff
+	txPPS := float64(currentStats.TxPackets-lastNetworkStats.TxPackets) / timeDiff
+
+	// Update last stats
+	lastNetworkStats = currentStats
+
+	return &SystemStats{
+		NetworkRxMBps: rxMBps,
+		NetworkTxMBps: txMBps,
+		NetworkRxPPS:  rxPPS,
+		NetworkTxPPS:  txPPS,
+	}
+}
+
+// readNetworkStats reads network statistics from /proc/net/dev
+func readNetworkStats() *NetworkStats {
+	data, err := os.ReadFile("/proc/net/dev")
+	if err != nil {
+		return nil
+	}
+
+	lines := strings.Split(string(data), "\n")
+	var totalRxBytes, totalTxBytes, totalRxPackets, totalTxPackets uint64
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, ":") && !strings.HasPrefix(line, "Inter-") && !strings.HasPrefix(line, "face") {
+			// Parse network interface line
+			parts := strings.Fields(strings.Replace(line, ":", " ", 1))
+			if len(parts) >= 17 {
+				// Skip loopback interface
+				if parts[0] == "lo" {
+					continue
+				}
+
+				// Parse RX bytes (column 1), RX packets (column 2)
+				if rxBytes, err := strconv.ParseUint(parts[1], 10, 64); err == nil {
+					totalRxBytes += rxBytes
+				}
+				if rxPackets, err := strconv.ParseUint(parts[2], 10, 64); err == nil {
+					totalRxPackets += rxPackets
+				}
+
+				// Parse TX bytes (column 9), TX packets (column 10)
+				if txBytes, err := strconv.ParseUint(parts[9], 10, 64); err == nil {
+					totalTxBytes += txBytes
+				}
+				if txPackets, err := strconv.ParseUint(parts[10], 10, 64); err == nil {
+					totalTxPackets += txPackets
+				}
+			}
+		}
+	}
+
+	return &NetworkStats{
+		RxBytes:   totalRxBytes,
+		TxBytes:   totalTxBytes,
+		RxPackets: totalRxPackets,
+		TxPackets: totalTxPackets,
+		Timestamp: time.Now(),
+	}
 }
 
 // getProcessMemoryMB returns current process memory usage in MB

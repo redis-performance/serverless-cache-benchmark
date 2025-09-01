@@ -8,12 +8,23 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
 )
+
+// PopulateStats tracks populate operation statistics
+type PopulateStats struct {
+	TotalOps   int64
+	SuccessOps int64
+	FailedOps  int64
+	StartTime  time.Time
+	CSVLogger  *CSVLogger
+}
 
 // CacheClient interface defines the operations for cache data sinks
 type CacheClient interface {
@@ -68,12 +79,13 @@ type ClientWorker struct {
 }
 
 // workerRoutine runs a single client worker with rate limiting and channel-based stats
-func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, keyPrefix string, verbose bool, timeoutSeconds int) {
+func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, keyPrefix string, verbose bool, timeoutSeconds int, populateStats *PopulateStats) {
 	defer wg.Done()
 	defer cw.Client.Close()
 
 	var errorCount int64
-	const maxErrorsToLog = 10 // Limit error logging to prevent spam
+	const maxErrorsToLog = 10            // Limit error logging to prevent spam
+	errorSummary := make(map[string]int) // Track error types
 
 	for i := cw.KeyStart; i <= cw.KeyEnd; i++ {
 		select {
@@ -97,10 +109,16 @@ func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, k
 
 		data, err := cw.Generator.GenerateData()
 		if err != nil {
+			errorType := fmt.Sprintf("DataGen: %v", err)
+			errorSummary[errorType]++
 			if verbose && errorCount < maxErrorsToLog {
 				log.Printf("Client %d: Failed to generate data for key %s: %v", cw.ID, key, err)
+			} else if errorCount == maxErrorsToLog {
+				log.Printf("Client %d: Suppressing further error logs. Error summary will be shown at end.", cw.ID)
 			}
 			cw.Stats.RecordError()
+			atomic.AddInt64(&populateStats.FailedOps, 1)
+			atomic.AddInt64(&populateStats.TotalOps, 1)
 			errorCount++
 			continue
 		}
@@ -115,21 +133,33 @@ func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, k
 		cancel()
 
 		if err != nil {
+			errorType := fmt.Sprintf("SET: %v", err)
+			errorSummary[errorType]++
 			if verbose && errorCount < maxErrorsToLog {
 				log.Printf("Client %d: Failed to set key %s: %v", cw.ID, key, err)
 			} else if errorCount == maxErrorsToLog {
-				log.Printf("Client %d: Suppressing further error logs (too many errors)", cw.ID)
+				log.Printf("Client %d: Suppressing further error logs. Error summary will be shown at end.", cw.ID)
 			}
 			cw.Stats.RecordError()
+			atomic.AddInt64(&populateStats.FailedOps, 1)
+			atomic.AddInt64(&populateStats.TotalOps, 1)
 			errorCount++
 			continue
 		}
 
 		// Channel-based stats recording (lock-free, non-blocking)
 		cw.Stats.RecordLatency(latency.Microseconds())
+		atomic.AddInt64(&populateStats.SuccessOps, 1)
+		atomic.AddInt64(&populateStats.TotalOps, 1)
 	}
 
-	// Don't log completion messages - they're just noise
+	// Log error summary if there were errors
+	if errorCount > maxErrorsToLog && len(errorSummary) > 0 {
+		log.Printf("Client %d: Error Summary (%d total errors):", cw.ID, errorCount)
+		for errorType, count := range errorSummary {
+			log.Printf("  %s: %d occurrences", errorType, count)
+		}
+	}
 }
 
 // createCacheClient creates a cache client based on the cache type
@@ -203,6 +233,7 @@ func runPopulate(cmd *cobra.Command, args []string) {
 	rps, _ := cmd.Flags().GetInt("rps")
 	timeoutSeconds, _ := cmd.Flags().GetInt("timeout")
 	verbose, _ := cmd.Flags().GetBool("verbose")
+	csvOutput, _ := cmd.Flags().GetString("csv-output")
 
 	// Get populate parameters
 	dataSize, _ := cmd.Flags().GetInt("data-size")
@@ -232,10 +263,24 @@ func runPopulate(cmd *cobra.Command, args []string) {
 		log.Fatalf("Not enough keys (%d) for %d clients", totalKeys, clientCount)
 	}
 
+	// Initialize CSV logging
+	if csvOutput == "" {
+		// Generate default filename with timestamp
+		timestamp := time.Now().Format("20060102-150405")
+		csvOutput = fmt.Sprintf("populate-%s-%s.csv", cacheType, timestamp)
+	}
+
+	csvLogger, err := NewCSVLogger(csvOutput)
+	if err != nil {
+		log.Fatalf("Failed to create CSV logger: %v", err)
+	}
+	defer csvLogger.Close()
+
 	fmt.Printf("Starting population of %s cache...\n", cacheType)
 	fmt.Printf("Clients: %d\n", clientCount)
 	fmt.Printf("Total keys: %d (range: %d to %d)\n", totalKeys, keyMin, keyMax)
 	fmt.Printf("Keys per client: %d\n", keysPerClient)
+	fmt.Printf("Logging metrics to: %s\n", csvOutput)
 	if rps > 0 {
 		fmt.Printf("Rate limit: %d RPS total (%.2f RPS per client)\n", rps, float64(rps)/float64(clientCount))
 	} else {
@@ -248,7 +293,13 @@ func runPopulate(cmd *cobra.Command, args []string) {
 	fmt.Println()
 
 	// Create shared performance stats
-	stats := NewPerformanceStats()
+	perfStats := NewPerformanceStats()
+
+	// Create populate stats for progress tracking
+	populateStats := &PopulateStats{
+		StartTime: time.Now(),
+		CSVLogger: csvLogger,
+	}
 
 	// Create context for cancellation
 	ctx, cancel := context.WithCancel(context.Background())
@@ -295,7 +346,7 @@ func runPopulate(cmd *cobra.Command, args []string) {
 			ID:        i,
 			Client:    client,
 			Generator: generator,
-			Stats:     stats,
+			Stats:     perfStats,
 			Limiter:   limiter,
 			KeyStart:  start,
 			KeyEnd:    end,
@@ -306,31 +357,8 @@ func runPopulate(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	// Start progress reporting goroutine with reduced frequency to minimize overhead
-	go func() {
-		ticker := time.NewTicker(2 * time.Second) // Reduced frequency
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				// Only collect stats if we have significant operations to reduce lock contention
-				total, success, failed, qps := stats.GetOverallStats()
-				if total > 100 { // Only report if we have meaningful progress
-					count, p50, p95, p99, max := stats.GetCurrentSecondStats()
-					if count > 0 {
-						fmt.Printf("Progress: %d ops, %.0f QPS, Success: %d, Failed: %d | Last 2s: %d ops, P50: %d μs, P95: %d μs, P99: %d μs, Max: %d μs\n",
-							total, qps, success, failed, count, p50, p95, p99, max)
-					} else {
-						fmt.Printf("Progress: %d ops, %.0f QPS, Success: %d, Failed: %d | Last 2s: no operations\n",
-							total, qps, success, failed)
-					}
-				}
-			}
-		}
-	}()
+	// Start progress reporting with progress bar
+	go reportPopulateProgress(ctx, populateStats, totalKeys, verbose)
 
 	// Start all workers
 	if verbose {
@@ -341,7 +369,7 @@ func runPopulate(cmd *cobra.Command, args []string) {
 
 	for i, worker := range workers {
 		wg.Add(1)
-		go worker.workerRoutine(ctx, &wg, keyPrefix, verbose, timeoutSeconds)
+		go worker.workerRoutine(ctx, &wg, keyPrefix, verbose, timeoutSeconds, populateStats)
 		if verbose {
 			fmt.Printf("Started worker %d\n", i)
 		}
@@ -350,11 +378,12 @@ func runPopulate(cmd *cobra.Command, args []string) {
 	// Wait for all workers to complete
 	wg.Wait()
 
-	// Close the stats collector
-	stats.Close()
+	// Clear progress line and close the stats collector
+	fmt.Print("\r" + strings.Repeat(" ", 150) + "\r")
+	perfStats.Close()
 
 	// Print final statistics
-	printStats(stats, clientCount)
+	printStats(perfStats, clientCount)
 }
 
 func init() {
@@ -370,6 +399,7 @@ func init() {
 	populateCmd.Flags().IntP("timeout", "T", 10, "Operation timeout in seconds")
 	populateCmd.Flags().BoolP("verbose", "v", false, "Enable verbose output (show worker details)")
 	populateCmd.Flags().Int("default-ttl", 3600, "Default TTL in seconds for cache entries (0 = no expiration for Redis, 60s minimum for Momento)")
+	populateCmd.Flags().String("csv-output", "", "CSV file to log populate metrics (default: auto-generated filename)")
 
 	// Redis Options
 	populateCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI (redis://[username[:password]@]host[:port][/db-number] or rediss:// for TLS)")
@@ -399,4 +429,79 @@ func init() {
 	populateCmd.Flags().String("key-prefix", "memtier-", "Prefix for keys")
 	populateCmd.Flags().Int("key-minimum", 0, "Key ID minimum value")
 	populateCmd.Flags().Int("key-maximum", 10000000, "Key ID maximum value")
+}
+
+// reportPopulateProgress reports populate progress with progress bar and system monitoring
+func reportPopulateProgress(ctx context.Context, stats *PopulateStats, totalKeys int, verbose bool) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Clear the progress line
+			fmt.Print("\r" + strings.Repeat(" ", 150) + "\r")
+			return
+		case <-ticker.C:
+			totalOps := atomic.LoadInt64(&stats.TotalOps)
+			successOps := atomic.LoadInt64(&stats.SuccessOps)
+			failedOps := atomic.LoadInt64(&stats.FailedOps)
+
+			elapsed := time.Since(stats.StartTime)
+
+			if totalOps > 0 {
+				qps := float64(totalOps) / elapsed.Seconds()
+				successRate := float64(successOps) / float64(totalOps) * 100
+
+				// Create progress bar based on completion
+				progress := float64(totalOps) / float64(totalKeys)
+				if progress > 1.0 {
+					progress = 1.0
+				}
+				progressBar := createPopulateProgressBar(progress, elapsed)
+
+				// Get system resource usage
+				sysStats := getSystemStats()
+				procMemMB := getProcessMemoryMB()
+
+				// Format the progress line with resource monitoring
+				progressLine := fmt.Sprintf("\r%s | %.0f ops/s | Success: %d (%.1f%%) | Failed: %d | Mem: %.1fGB/%.1fGB | CPU: %.0f%% | Proc: %.1fGB",
+					progressBar, qps, successOps, successRate, failedOps,
+					sysStats.MemoryUsedMB/1024, sysStats.MemoryTotalMB/1024,
+					sysStats.CPUPercent, procMemMB/1024)
+
+				// Truncate if too long for terminal
+				if len(progressLine) > 150 {
+					progressLine = progressLine[:147] + "..."
+				}
+
+				fmt.Print(progressLine)
+			}
+		}
+	}
+}
+
+// createPopulateProgressBar creates a progress bar for populate operations
+func createPopulateProgressBar(progress float64, elapsed time.Duration) string {
+	barWidth := 20
+	filled := int(progress * float64(barWidth))
+
+	bar := "["
+	for i := 0; i < barWidth; i++ {
+		if i < filled {
+			bar += "="
+		} else if i == filled && progress < 1.0 {
+			bar += ">"
+		} else {
+			bar += "-"
+		}
+	}
+	bar += "]"
+
+	// Add elapsed time and percentage
+	minutes := int(elapsed.Minutes())
+	seconds := int(elapsed.Seconds()) % 60
+	timeStr := fmt.Sprintf("%02d:%02d", minutes, seconds)
+
+	return fmt.Sprintf("%s %s (%.1f%%)", bar, timeStr, progress*100)
 }
