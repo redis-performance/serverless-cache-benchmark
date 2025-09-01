@@ -5,23 +5,14 @@ package cmd
 
 import (
 	"context"
-	cryptorand "crypto/rand"
 	"fmt"
 	"log"
-	"math/rand"
 	"runtime"
-	"strconv"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/HdrHistogram/hdrhistogram-go"
-	"github.com/momentohq/client-sdk-go/auth"
-	"github.com/momentohq/client-sdk-go/config"
-	"github.com/momentohq/client-sdk-go/momento"
-	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
+	"golang.org/x/time/rate"
 )
 
 // CacheClient interface defines the operations for cache data sinks
@@ -29,108 +20,6 @@ type CacheClient interface {
 	Set(ctx context.Context, key string, value []byte, expiration time.Duration) error
 	Close() error
 	Name() string
-}
-
-// RedisClient implements CacheClient for Redis
-type RedisClient struct {
-	client *redis.Client
-}
-
-func NewRedisClient(addr, password string, db int) *RedisClient {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     addr,
-		Password: password,
-		DB:       db,
-	})
-	return &RedisClient{client: rdb}
-}
-
-func (r *RedisClient) Set(ctx context.Context, key string, value []byte, expiration time.Duration) error {
-	return r.client.Set(ctx, key, value, expiration).Err()
-}
-
-func (r *RedisClient) Close() error {
-	return r.client.Close()
-}
-
-func (r *RedisClient) Name() string {
-	return "Redis"
-}
-
-// MomentoClient implements CacheClient for Momento
-type MomentoClient struct {
-	client    momento.CacheClient
-	cacheName string
-}
-
-func NewMomentoClient(apiKey, cacheName string, createCache bool) (*MomentoClient, error) {
-	var credential auth.CredentialProvider
-	var err error
-
-	if apiKey != "" {
-		credential, err = auth.NewStringMomentoTokenProvider(apiKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create string token provider: %w", err)
-		}
-	} else {
-		credential, err = auth.NewEnvMomentoTokenProvider("MOMENTO_API_KEY")
-		if err != nil {
-			return nil, fmt.Errorf("failed to get Momento credentials: %w", err)
-		}
-	}
-
-	client, err := momento.NewCacheClient(
-		config.LaptopLatest(),
-		credential,
-		60*time.Second,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Momento client: %w", err)
-	}
-
-	// Try to create the cache if it doesn't exist and createCache is true
-	if createCache {
-		ctx := context.Background()
-		_, err = client.CreateCache(ctx, &momento.CreateCacheRequest{
-			CacheName: cacheName,
-		})
-		if err != nil {
-			// Check if it's an "already exists" error, which is fine
-			if !strings.Contains(err.Error(), "already exists") && !strings.Contains(err.Error(), "AlreadyExists") {
-				log.Printf("Warning: Failed to create cache '%s': %v", cacheName, err)
-			}
-		} else {
-			log.Printf("Created Momento cache: %s", cacheName)
-		}
-	}
-
-	return &MomentoClient{
-		client:    client,
-		cacheName: cacheName,
-	}, nil
-}
-
-func (m *MomentoClient) Set(ctx context.Context, key string, value []byte, expiration time.Duration) error {
-	setRequest := &momento.SetRequest{
-		CacheName: m.cacheName,
-		Key:       momento.String(key),
-		Value:     momento.Bytes(value),
-	}
-
-	// For now, we'll skip TTL setting as the API might be different
-	// The cache will use default TTL settings
-
-	_, err := m.client.Set(ctx, setRequest)
-	return err
-}
-
-func (m *MomentoClient) Close() error {
-	m.client.Close()
-	return nil
-}
-
-func (m *MomentoClient) Name() string {
-	return "Momento"
 }
 
 // populateCmd represents the populate command
@@ -141,157 +30,39 @@ var populateCmd = &cobra.Command{
 
 This command supports populating both Redis and Momento cache systems with configurable
 test data including different data sizes, key patterns, and expiration settings. It uses
-multiple concurrent clients (goroutines) to maximize throughput and provides real-time
-performance metrics including QPS and latency percentiles using HDR histogram.
+multiple concurrent clients (goroutines) with optional rate limiting and provides real-time
+performance metrics including QPS and per-second latency percentiles using HDR histogram.
 
 Examples:
-  # Populate Redis with default number of clients (CPU cores)
-  serverless-cache-benchmark populate --cache-type redis --redis-addr localhost:6379
+  # Populate Redis with default number of clients (CPU cores), unlimited rate
+  serverless-cache-benchmark populate --cache-type redis --redis-uri redis://localhost:6379
 
-  # Populate Momento with custom data size and 8 clients
-  serverless-cache-benchmark populate --cache-type momento --momento-cache-name test-cache --data-size 1024 --clients 8
+  # Populate Redis with authentication and database selection
+  serverless-cache-benchmark populate --cache-type redis --redis-uri redis://user:pass@localhost:6380/2
 
-  # Populate with random data sizes and 10 clients
-  serverless-cache-benchmark populate --cache-type redis --redis-addr localhost:6379 --data-size-range 100-2048 --clients 10`,
+  # Populate Redis with TLS connection
+  serverless-cache-benchmark populate --cache-type redis --redis-uri rediss://localhost:6380
+
+  # Populate Momento with rate limiting at 1000 RPS total
+  serverless-cache-benchmark populate --cache-type momento --momento-cache-name test-cache --rps 1000
+
+  # Populate with 4 clients at 500 RPS (125 RPS per client)
+  serverless-cache-benchmark populate --cache-type redis --redis-uri redis://localhost:6379 --clients 4 --rps 500`,
 	Run: runPopulate,
-}
-
-// PerformanceStats tracks performance metrics
-type PerformanceStats struct {
-	TotalOps   int64
-	SuccessOps int64
-	FailedOps  int64
-	Histogram  *hdrhistogram.Histogram
-	StartTime  time.Time
-	mutex      sync.RWMutex
-}
-
-func NewPerformanceStats() *PerformanceStats {
-	// Create histogram with 1 microsecond to 1 minute range, 3 significant digits
-	hist := hdrhistogram.New(1, 60*1000*1000, 3)
-	return &PerformanceStats{
-		Histogram: hist,
-		StartTime: time.Now(),
-	}
-}
-
-func (ps *PerformanceStats) RecordLatency(latencyMicros int64) {
-	ps.mutex.Lock()
-	defer ps.mutex.Unlock()
-	ps.Histogram.RecordValue(latencyMicros)
-	atomic.AddInt64(&ps.SuccessOps, 1)
-	atomic.AddInt64(&ps.TotalOps, 1)
-}
-
-func (ps *PerformanceStats) RecordError() {
-	atomic.AddInt64(&ps.FailedOps, 1)
-	atomic.AddInt64(&ps.TotalOps, 1)
-}
-
-func (ps *PerformanceStats) GetQPS() float64 {
-	elapsed := time.Since(ps.StartTime).Seconds()
-	if elapsed == 0 {
-		return 0
-	}
-	return float64(atomic.LoadInt64(&ps.TotalOps)) / elapsed
-}
-
-func (ps *PerformanceStats) GetStats() (int64, int64, int64, float64, int64, int64, int64) {
-	ps.mutex.RLock()
-	defer ps.mutex.RUnlock()
-
-	total := atomic.LoadInt64(&ps.TotalOps)
-	success := atomic.LoadInt64(&ps.SuccessOps)
-	failed := atomic.LoadInt64(&ps.FailedOps)
-	qps := ps.GetQPS()
-
-	var p50, p95, p99 int64
-	if ps.Histogram.TotalCount() > 0 {
-		p50 = ps.Histogram.ValueAtQuantile(50)
-		p95 = ps.Histogram.ValueAtQuantile(95)
-		p99 = ps.Histogram.ValueAtQuantile(99)
-	}
-
-	return total, success, failed, qps, p50, p95, p99
 }
 
 // ClientWorker represents a single client worker
 type ClientWorker struct {
 	ID        int
 	Client    CacheClient
-	Generator *DataGenerator
 	Stats     *PerformanceStats
+	Limiter   *rate.Limiter // Rate limiter for this client
+	Generator *DataGenerator
 	KeyStart  int
 	KeyEnd    int
 }
 
-// DataGenerator handles data generation for populate operations
-type DataGenerator struct {
-	DataSize        int
-	RandomData      bool
-	DataSizeRange   string
-	DataSizeList    string
-	DataSizePattern string
-	ExpiryRange     string
-}
-
-func (dg *DataGenerator) GenerateData() ([]byte, error) {
-	size := dg.DataSize
-
-	// Handle data size range
-	if dg.DataSizeRange != "" {
-		parts := strings.Split(dg.DataSizeRange, "-")
-		if len(parts) == 2 {
-			min, err1 := strconv.Atoi(parts[0])
-			max, err2 := strconv.Atoi(parts[1])
-			if err1 == nil && err2 == nil && min <= max {
-				if dg.DataSizePattern == "R" {
-					// Random size between min and max
-					size = min + rand.Intn(max-min+1)
-				} else {
-					// For simplicity, use average for "S" pattern
-					size = (min + max) / 2
-				}
-			}
-		}
-	}
-
-	data := make([]byte, size)
-	if dg.RandomData {
-		_, err := cryptorand.Read(data)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate random data: %w", err)
-		}
-	} else {
-		// Fill with pattern data
-		pattern := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-		for i := range data {
-			data[i] = pattern[i%len(pattern)]
-		}
-	}
-
-	return data, nil
-}
-
-func (dg *DataGenerator) GetExpiration() time.Duration {
-	if dg.ExpiryRange == "" {
-		return 0 // No expiration
-	}
-
-	parts := strings.Split(dg.ExpiryRange, "-")
-	if len(parts) == 2 {
-		min, err1 := strconv.Atoi(parts[0])
-		max, err2 := strconv.Atoi(parts[1])
-		if err1 == nil && err2 == nil && min <= max {
-			expiry := min + rand.Intn(max-min+1)
-			return time.Duration(expiry) * time.Second
-		}
-	}
-
-	return 0
-}
-
-// workerRoutine runs a single client worker
+// workerRoutine runs a single client worker with rate limiting
 func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, keyPrefix string) {
 	defer wg.Done()
 	defer cw.Client.Close()
@@ -301,6 +72,15 @@ func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, k
 		case <-ctx.Done():
 			return
 		default:
+		}
+
+		// Apply rate limiting if configured
+		if cw.Limiter != nil {
+			err := cw.Limiter.Wait(ctx)
+			if err != nil {
+				log.Printf("Client %d: Rate limiter error: %v", cw.ID, err)
+				return
+			}
 		}
 
 		key := fmt.Sprintf("%s%d", keyPrefix, i)
@@ -332,10 +112,12 @@ func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, k
 func createCacheClient(cacheType string, cmd *cobra.Command) (CacheClient, error) {
 	switch cacheType {
 	case "redis":
-		addr, _ := cmd.Flags().GetString("redis-addr")
-		password, _ := cmd.Flags().GetString("redis-password")
-		db, _ := cmd.Flags().GetInt("redis-db")
-		return NewRedisClient(addr, password, db), nil
+		uri, _ := cmd.Flags().GetString("redis-uri")
+		client, err := NewRedisClientFromURI(uri)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Redis client from URI '%s': %w", uri, err)
+		}
+		return client, nil
 
 	case "momento":
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
@@ -371,6 +153,7 @@ func printStats(stats *PerformanceStats, clientCount int) {
 func runPopulate(cmd *cobra.Command, args []string) {
 	cacheType, _ := cmd.Flags().GetString("cache-type")
 	clientCount, _ := cmd.Flags().GetInt("clients")
+	rps, _ := cmd.Flags().GetInt("rps")
 
 	// Get populate parameters
 	dataSize, _ := cmd.Flags().GetInt("data-size")
@@ -403,6 +186,11 @@ func runPopulate(cmd *cobra.Command, args []string) {
 	fmt.Printf("Clients: %d\n", clientCount)
 	fmt.Printf("Total keys: %d (range: %d to %d)\n", totalKeys, keyMin, keyMax)
 	fmt.Printf("Keys per client: %d\n", keysPerClient)
+	if rps > 0 {
+		fmt.Printf("Rate limit: %d RPS total (%.2f RPS per client)\n", rps, float64(rps)/float64(clientCount))
+	} else {
+		fmt.Printf("Rate limit: unlimited\n")
+	}
 	fmt.Printf("Data size: %d bytes", dataSize)
 	if dataSizeRange != "" {
 		fmt.Printf(" (range: %s)", dataSizeRange)
@@ -445,11 +233,19 @@ func runPopulate(cmd *cobra.Command, args []string) {
 			ExpiryRange:     expiryRange,
 		}
 
+		// Create rate limiter for this client if RPS is specified
+		var limiter *rate.Limiter
+		if rps > 0 {
+			clientRPS := float64(rps) / float64(clientCount)
+			limiter = rate.NewLimiter(rate.Limit(clientRPS), 1) // Burst of 1
+		}
+
 		workers[i] = &ClientWorker{
 			ID:        i,
 			Client:    client,
 			Generator: generator,
 			Stats:     stats,
+			Limiter:   limiter,
 			KeyStart:  start,
 			KeyEnd:    end,
 		}
@@ -467,10 +263,16 @@ func runPopulate(cmd *cobra.Command, args []string) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				total, success, failed, qps, p50, p95, p99 := stats.GetStats()
+				total, success, failed, qps := stats.GetOverallStats()
+				count, p50, p95, p99, max := stats.GetCurrentSecondStats()
 				if total > 0 {
-					fmt.Printf("Progress: %d ops, %.0f QPS, Success: %d, Failed: %d, P50: %d μs, P95: %d μs, P99: %d μs\n",
-						total, qps, success, failed, p50, p95, p99)
+					if count > 0 {
+						fmt.Printf("Progress: %d ops, %.0f QPS, Success: %d, Failed: %d | Last sec: %d ops, P50: %d μs, P95: %d μs, P99: %d μs, Max: %d μs\n",
+							total, qps, success, failed, count, p50, p95, p99, max)
+					} else {
+						fmt.Printf("Progress: %d ops, %.0f QPS, Success: %d, Failed: %d | Last sec: no operations\n",
+							total, qps, success, failed)
+					}
 				}
 			}
 		}
@@ -499,11 +301,10 @@ func init() {
 
 	// Client Options
 	populateCmd.Flags().IntP("clients", "c", runtime.NumCPU(), "Number of concurrent clients (default: number of CPU cores)")
+	populateCmd.Flags().IntP("rps", "r", 0, "Rate limit in requests per second (0 = unlimited)")
 
 	// Redis Options
-	populateCmd.Flags().String("redis-addr", "localhost:6379", "Redis server address")
-	populateCmd.Flags().String("redis-password", "", "Redis password")
-	populateCmd.Flags().Int("redis-db", 0, "Redis database number")
+	populateCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI (redis://[username[:password]@]host[:port][/db-number] or rediss:// for TLS)")
 
 	// Momento Options
 	populateCmd.Flags().String("momento-api-key", "", "Momento API key (or set MOMENTO_API_KEY env var)")
