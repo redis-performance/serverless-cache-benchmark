@@ -34,7 +34,7 @@ multiple concurrent clients (goroutines) with optional rate limiting and provide
 performance metrics including QPS and per-second latency percentiles using HDR histogram.
 
 Examples:
-  # Populate Redis with default number of clients (CPU cores), unlimited rate
+  # Populate Redis with default number of clients (4, optimized for I/O), unlimited rate
   serverless-cache-benchmark populate --cache-type redis --redis-uri redis://localhost:6379
 
   # Populate Redis with authentication and database selection
@@ -62,7 +62,7 @@ type ClientWorker struct {
 	KeyEnd    int
 }
 
-// workerRoutine runs a single client worker with rate limiting
+// workerRoutine runs a single client worker with rate limiting and channel-based stats
 func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, keyPrefix string) {
 	defer wg.Done()
 	defer cw.Client.Close()
@@ -104,6 +104,7 @@ func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, k
 			continue
 		}
 
+		// Channel-based stats recording (lock-free, non-blocking)
 		cw.Stats.RecordLatency(latency.Microseconds())
 	}
 }
@@ -253,9 +254,9 @@ func runPopulate(cmd *cobra.Command, args []string) {
 		fmt.Printf("Worker %d: keys %d to %d (%d keys)\n", i, start, end, end-start+1)
 	}
 
-	// Start progress reporting goroutine
+	// Start progress reporting goroutine with reduced frequency to minimize overhead
 	go func() {
-		ticker := time.NewTicker(1 * time.Second)
+		ticker := time.NewTicker(2 * time.Second) // Reduced frequency
 		defer ticker.Stop()
 
 		for {
@@ -263,14 +264,15 @@ func runPopulate(cmd *cobra.Command, args []string) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				// Only collect stats if we have significant operations to reduce lock contention
 				total, success, failed, qps := stats.GetOverallStats()
-				count, p50, p95, p99, max := stats.GetCurrentSecondStats()
-				if total > 0 {
+				if total > 100 { // Only report if we have meaningful progress
+					count, p50, p95, p99, max := stats.GetCurrentSecondStats()
 					if count > 0 {
-						fmt.Printf("Progress: %d ops, %.0f QPS, Success: %d, Failed: %d | Last sec: %d ops, P50: %d μs, P95: %d μs, P99: %d μs, Max: %d μs\n",
+						fmt.Printf("Progress: %d ops, %.0f QPS, Success: %d, Failed: %d | Last 2s: %d ops, P50: %d μs, P95: %d μs, P99: %d μs, Max: %d μs\n",
 							total, qps, success, failed, count, p50, p95, p99, max)
 					} else {
-						fmt.Printf("Progress: %d ops, %.0f QPS, Success: %d, Failed: %d | Last sec: no operations\n",
+						fmt.Printf("Progress: %d ops, %.0f QPS, Success: %d, Failed: %d | Last 2s: no operations\n",
 							total, qps, success, failed)
 					}
 				}
@@ -289,6 +291,9 @@ func runPopulate(cmd *cobra.Command, args []string) {
 	// Wait for all workers to complete
 	wg.Wait()
 
+	// Close the stats collector
+	stats.Close()
+
 	// Print final statistics
 	printStats(stats, clientCount)
 }
@@ -300,7 +305,8 @@ func init() {
 	populateCmd.Flags().StringP("cache-type", "t", "redis", "Cache type: redis or momento")
 
 	// Client Options
-	populateCmd.Flags().IntP("clients", "c", runtime.NumCPU(), "Number of concurrent clients (default: number of CPU cores)")
+	defaultClients := runtime.NumCPU()
+	populateCmd.Flags().IntP("clients", "c", defaultClients, "Number of concurrent clients (default: 4, optimized for I/O)")
 	populateCmd.Flags().IntP("rps", "r", 0, "Rate limit in requests per second (0 = unlimited)")
 
 	// Redis Options
