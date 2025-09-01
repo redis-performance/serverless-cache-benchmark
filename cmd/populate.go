@@ -7,10 +7,13 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -19,11 +22,13 @@ import (
 
 // PopulateStats tracks populate operation statistics
 type PopulateStats struct {
-	TotalOps   int64
-	SuccessOps int64
-	FailedOps  int64
-	StartTime  time.Time
-	CSVLogger  *CSVLogger
+	TotalOps    int64
+	SuccessOps  int64
+	FailedOps   int64
+	ActiveConns int64 // Current number of active connections
+	StartTime   time.Time
+	CSVLogger   *CSVLogger
+	PerfStats   *PerformanceStats // Reference to performance stats for latency data
 }
 
 // CacheClient interface defines the operations for cache data sinks
@@ -82,6 +87,7 @@ type ClientWorker struct {
 func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, keyPrefix string, verbose bool, timeoutSeconds int, populateStats *PopulateStats) {
 	defer wg.Done()
 	defer cw.Client.Close()
+	defer atomic.AddInt64(&populateStats.ActiveConns, -1) // Decrement when worker finishes
 
 	var errorCount int64
 	const maxErrorsToLog = 10            // Limit error logging to prevent spam
@@ -297,13 +303,27 @@ func runPopulate(cmd *cobra.Command, args []string) {
 
 	// Create populate stats for progress tracking
 	populateStats := &PopulateStats{
-		StartTime: time.Now(),
-		CSVLogger: csvLogger,
+		StartTime:   time.Now(),
+		CSVLogger:   csvLogger,
+		PerfStats:   perfStats,
+		ActiveConns: int64(clientCount), // Start with all clients as active
 	}
 
 	// Create context for cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Handle signals in a separate goroutine
+	go func() {
+		<-sigChan
+		fmt.Print("\r" + strings.Repeat(" ", 150) + "\r") // Clear progress line
+		fmt.Println("\nReceived interrupt signal. Stopping workers and printing summary...")
+		cancel() // Cancel context to stop all workers
+	}()
 
 	// Create workers
 	var wg sync.WaitGroup
@@ -465,10 +485,10 @@ func reportPopulateProgress(ctx context.Context, stats *PopulateStats, totalKeys
 				procMemMB := getProcessMemoryMB()
 
 				// Format the progress line with resource monitoring
-				progressLine := fmt.Sprintf("\r%s | %.0f ops/s | Success: %d (%.1f%%) | Failed: %d | Mem: %.1fGB/%.1fGB | CPU: %.0f%% | Proc: %.1fGB",
+				progressLine := fmt.Sprintf("\r%s | %.0f ops/s | Success: %d (%.1f%%) | Failed: %d | Mem: %.1fGB/%.1fGB | CPU: %.0f%% | Proc: %.1fGB | Net: %.1f/%.1f MB/s",
 					progressBar, qps, successOps, successRate, failedOps,
 					sysStats.MemoryUsedMB/1024, sysStats.MemoryTotalMB/1024,
-					sysStats.CPUPercent, procMemMB/1024)
+					sysStats.CPUPercent, procMemMB/1024, sysStats.NetworkRxMBps, sysStats.NetworkTxMBps)
 
 				// Truncate if too long for terminal
 				if len(progressLine) > 150 {
@@ -476,6 +496,45 @@ func reportPopulateProgress(ctx context.Context, stats *PopulateStats, totalKeys
 				}
 
 				fmt.Print(progressLine)
+
+				// Log to CSV if available
+				if stats.CSVLogger != nil {
+					// Get latency metrics from performance stats
+					_, _, _, _, p50, p95, p99 := stats.PerfStats.GetStats()
+
+					snapshot := MetricsSnapshot{
+						Timestamp:       time.Now(),
+						ElapsedSeconds:  int(elapsed.Seconds()),
+						TargetClients:   0,  // Not applicable for populate
+						ActualClients:   0,  // Not applicable for populate
+						TargetQPS:       -1, // Not applicable for populate
+						ActualTotalQPS:  qps,
+						ActualGetQPS:    0, // Only SET operations in populate
+						ActualSetQPS:    qps,
+						TotalOps:        totalOps,
+						GetOps:          0,
+						SetOps:          successOps,
+						GetErrors:       0,
+						SetErrors:       failedOps,
+						GetLatencyP50:   0, // GET latencies not applicable
+						GetLatencyP95:   0,
+						GetLatencyP99:   0,
+						GetLatencyMax:   0,
+						SetLatencyP50:   p50, // Use performance stats for SET latencies
+						SetLatencyP95:   p95,
+						SetLatencyP99:   p99,
+						SetLatencyMax:   stats.PerfStats.Histogram.Max(),
+						NetworkRxMBps:   sysStats.NetworkRxMBps,
+						NetworkTxMBps:   sysStats.NetworkTxMBps,
+						NetworkRxPPS:    sysStats.NetworkRxPPS,
+						NetworkTxPPS:    sysStats.NetworkTxPPS,
+						MemoryUsedGB:    sysStats.MemoryUsedMB / 1024,
+						MemoryTotalGB:   sysStats.MemoryTotalMB / 1024,
+						CPUPercent:      sysStats.CPUPercent,
+						ProcessMemoryGB: procMemMB / 1024,
+					}
+					stats.CSVLogger.LogMetrics(snapshot)
+				}
 			}
 		}
 	}
