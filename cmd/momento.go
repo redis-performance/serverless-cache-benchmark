@@ -9,6 +9,7 @@ import (
 
 	"github.com/momentohq/client-sdk-go/auth"
 	"github.com/momentohq/client-sdk-go/config"
+	"github.com/momentohq/client-sdk-go/config/logger/momento_default_logger"
 	"github.com/momentohq/client-sdk-go/momento"
 )
 
@@ -21,6 +22,7 @@ type MomentoClient struct {
 func NewMomentoClient(apiKey, cacheName string, createCache bool, defaultTTLSeconds int) (*MomentoClient, error) {
 	var credential auth.CredentialProvider
 	var err error
+	loggerFactory := momento_default_logger.NewDefaultMomentoLoggerFactory(momento_default_logger.WARN)
 
 	if apiKey != "" {
 		credential, err = auth.NewStringMomentoTokenProvider(apiKey)
@@ -41,7 +43,7 @@ func NewMomentoClient(apiKey, cacheName string, createCache bool, defaultTTLSeco
 	}
 
 	client, err := momento.NewCacheClient(
-		config.LaptopLatest(),
+		config.LaptopLatestWithLogger(loggerFactory),
 		credential,
 		defaultTTL,
 	)
@@ -61,7 +63,7 @@ func NewMomentoClient(apiKey, cacheName string, createCache bool, defaultTTLSeco
 				log.Printf("Warning: Failed to create cache '%s': %v", cacheName, err)
 			}
 		} else {
-			log.Printf("Created Momento cache: %s", cacheName)
+			fmt.Printf("Momento cache ready: %s\n", cacheName)
 		}
 	}
 

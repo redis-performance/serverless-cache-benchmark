@@ -8,7 +8,6 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"os"
@@ -350,7 +349,7 @@ func getSystemStats() SystemStats {
 	stats := SystemStats{}
 
 	// Get memory info from /proc/meminfo
-	if data, err := ioutil.ReadFile("/proc/meminfo"); err == nil {
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
 		lines := strings.Split(string(data), "\n")
 		for _, line := range lines {
 			if strings.HasPrefix(line, "MemTotal:") {
@@ -371,7 +370,7 @@ func getSystemStats() SystemStats {
 	}
 
 	// Get CPU usage from /proc/loadavg (1-minute load average)
-	if data, err := ioutil.ReadFile("/proc/loadavg"); err == nil {
+	if data, err := os.ReadFile("/proc/loadavg"); err == nil {
 		if fields := strings.Fields(string(data)); len(fields) >= 1 {
 			if load, err := strconv.ParseFloat(fields[0], 64); err == nil {
 				// Convert load average to rough CPU percentage
@@ -389,7 +388,7 @@ func getSystemStats() SystemStats {
 
 // getProcessMemoryMB returns current process memory usage in MB
 func getProcessMemoryMB() float64 {
-	if data, err := ioutil.ReadFile("/proc/self/status"); err == nil {
+	if data, err := os.ReadFile("/proc/self/status"); err == nil {
 		lines := strings.Split(string(data), "\n")
 		for _, line := range lines {
 			if strings.HasPrefix(line, "VmRSS:") {
@@ -804,19 +803,6 @@ func runDynamicWorkload(cmd *cobra.Command, trafficPatternFile, cacheType string
 
 	// Print final results with time block breakdown
 	printDynamicFinalResults(stats, trafficConfigs, measureSetup)
-}
-
-// runWorker runs a single worker that performs mixed GET/SET operations
-func runWorker(ctx context.Context, wg *sync.WaitGroup, workerID int, client CacheClient,
-	totalKeys int, zipfExp float64, generator *DataGenerator, stats *WorkloadStats,
-	setRatio, getRatio int, keyPrefix string, keyMin int,
-	limiter *rate.Limiter, timeoutSeconds int, verbose bool) {
-
-	defer wg.Done()
-	defer client.Close()
-
-	runWorkerInternal(ctx, workerID, client, totalKeys, zipfExp, generator, stats,
-		setRatio, getRatio, keyPrefix, keyMin, limiter, timeoutSeconds, verbose)
 }
 
 // runWorkerInternal contains the actual worker logic without WaitGroup management
