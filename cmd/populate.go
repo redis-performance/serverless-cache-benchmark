@@ -127,9 +127,7 @@ func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, k
 		cw.Stats.RecordLatency(latency.Microseconds())
 	}
 
-	if errorCount > 0 && !verbose {
-		log.Printf("Client %d: Completed with %d errors", cw.ID, errorCount)
-	}
+	// Don't log completion messages - they're just noise
 }
 
 // createCacheClient creates a cache client based on the cache type
