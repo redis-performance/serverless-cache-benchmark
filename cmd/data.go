@@ -45,6 +45,7 @@ type DataGenerator struct {
 	DataSizeList    string
 	DataSizePattern string
 	ExpiryRange     string
+	DefaultTTL      int // Default TTL in seconds (0 = no expiration)
 }
 
 func (dg *DataGenerator) GenerateData() ([]byte, error) {
@@ -85,19 +86,24 @@ func (dg *DataGenerator) GenerateData() ([]byte, error) {
 }
 
 func (dg *DataGenerator) GetExpiration() time.Duration {
-	if dg.ExpiryRange == "" {
-		return 0 // No expiration
-	}
-
-	parts := strings.Split(dg.ExpiryRange, "-")
-	if len(parts) == 2 {
-		min, err1 := strconv.Atoi(parts[0])
-		max, err2 := strconv.Atoi(parts[1])
-		if err1 == nil && err2 == nil && min <= max {
-			expiry := min + rand.Intn(max-min+1)
-			return time.Duration(expiry) * time.Second
+	// If ExpiryRange is specified, use it (takes precedence)
+	if dg.ExpiryRange != "" {
+		parts := strings.Split(dg.ExpiryRange, "-")
+		if len(parts) == 2 {
+			min, err1 := strconv.Atoi(parts[0])
+			max, err2 := strconv.Atoi(parts[1])
+			if err1 == nil && err2 == nil && min <= max {
+				expiry := min + rand.Intn(max-min+1)
+				return time.Duration(expiry) * time.Second
+			}
 		}
 	}
 
+	// Fall back to DefaultTTL if specified
+	if dg.DefaultTTL > 0 {
+		return time.Duration(dg.DefaultTTL) * time.Second
+	}
+
+	// No expiration
 	return 0
 }

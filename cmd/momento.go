@@ -18,7 +18,7 @@ type MomentoClient struct {
 	cacheName string
 }
 
-func NewMomentoClient(apiKey, cacheName string, createCache bool) (*MomentoClient, error) {
+func NewMomentoClient(apiKey, cacheName string, createCache bool, defaultTTLSeconds int) (*MomentoClient, error) {
 	var credential auth.CredentialProvider
 	var err error
 
@@ -34,10 +34,16 @@ func NewMomentoClient(apiKey, cacheName string, createCache bool) (*MomentoClien
 		}
 	}
 
+	// Convert TTL seconds to duration, use 60 seconds as fallback if 0 or negative
+	defaultTTL := time.Duration(defaultTTLSeconds) * time.Second
+	if defaultTTLSeconds <= 0 {
+		defaultTTL = 60 * time.Second // Momento requires a default TTL
+	}
+
 	client, err := momento.NewCacheClient(
 		config.LaptopLatest(),
 		credential,
-		60*time.Second,
+		defaultTTL,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Momento client: %w", err)
@@ -72,8 +78,10 @@ func (m *MomentoClient) Set(ctx context.Context, key string, value []byte, expir
 		Value:     momento.Bytes(value),
 	}
 
-	// For now, we'll skip TTL setting as the API might be different
-	// The cache will use default TTL settings
+	// Set TTL if expiration is specified
+	if expiration > 0 {
+		setRequest.Ttl = expiration
+	}
 
 	_, err := m.client.Set(ctx, setRequest)
 	return err

@@ -169,7 +169,8 @@ func createCacheClient(cacheType string, cmd *cobra.Command) (CacheClient, error
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
 		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
 		createCache, _ := cmd.Flags().GetBool("momento-create-cache")
-		client, err := NewMomentoClient(apiKey, cacheName, createCache)
+		defaultTTL, _ := cmd.Flags().GetInt("default-ttl")
+		client, err := NewMomentoClient(apiKey, cacheName, createCache, defaultTTL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Momento client: %w", err)
 		}
@@ -210,6 +211,7 @@ func runPopulate(cmd *cobra.Command, args []string) {
 	dataSizeList, _ := cmd.Flags().GetString("data-size-list")
 	dataSizePattern, _ := cmd.Flags().GetString("data-size-pattern")
 	expiryRange, _ := cmd.Flags().GetString("expiry-range")
+	defaultTTL, _ := cmd.Flags().GetInt("default-ttl")
 	keyPrefix, _ := cmd.Flags().GetString("key-prefix")
 	keyMin, _ := cmd.Flags().GetInt("key-minimum")
 	keyMax, _ := cmd.Flags().GetInt("key-maximum")
@@ -279,6 +281,7 @@ func runPopulate(cmd *cobra.Command, args []string) {
 			DataSizeList:    dataSizeList,
 			DataSizePattern: dataSizePattern,
 			ExpiryRange:     expiryRange,
+			DefaultTTL:      defaultTTL,
 		}
 
 		// Create rate limiter for this client if RPS is specified
@@ -366,6 +369,7 @@ func init() {
 	populateCmd.Flags().IntP("rps", "r", 0, "Rate limit in requests per second (0 = unlimited)")
 	populateCmd.Flags().IntP("timeout", "T", 10, "Operation timeout in seconds")
 	populateCmd.Flags().BoolP("verbose", "v", false, "Enable verbose output (show worker details)")
+	populateCmd.Flags().Int("default-ttl", 3600, "Default TTL in seconds for cache entries (0 = no expiration for Redis, 60s minimum for Momento)")
 
 	// Redis Options
 	populateCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI (redis://[username[:password]@]host[:port][/db-number] or rediss:// for TLS)")

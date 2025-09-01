@@ -8,6 +8,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"os"
@@ -337,6 +338,72 @@ func parseRatio(ratioStr string) (int, int, error) {
 	return setRatio, getRatio, nil
 }
 
+// SystemStats holds lightweight system monitoring data
+type SystemStats struct {
+	MemoryUsedMB  float64
+	MemoryTotalMB float64
+	CPUPercent    float64
+}
+
+// getSystemStats returns current system resource usage (lightweight)
+func getSystemStats() SystemStats {
+	stats := SystemStats{}
+
+	// Get memory info from /proc/meminfo
+	if data, err := ioutil.ReadFile("/proc/meminfo"); err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "MemTotal:") {
+				if fields := strings.Fields(line); len(fields) >= 2 {
+					if kb, err := strconv.ParseFloat(fields[1], 64); err == nil {
+						stats.MemoryTotalMB = kb / 1024
+					}
+				}
+			} else if strings.HasPrefix(line, "MemAvailable:") {
+				if fields := strings.Fields(line); len(fields) >= 2 {
+					if kb, err := strconv.ParseFloat(fields[1], 64); err == nil {
+						availableMB := kb / 1024
+						stats.MemoryUsedMB = stats.MemoryTotalMB - availableMB
+					}
+				}
+			}
+		}
+	}
+
+	// Get CPU usage from /proc/loadavg (1-minute load average)
+	if data, err := ioutil.ReadFile("/proc/loadavg"); err == nil {
+		if fields := strings.Fields(string(data)); len(fields) >= 1 {
+			if load, err := strconv.ParseFloat(fields[0], 64); err == nil {
+				// Convert load average to rough CPU percentage
+				// Load of 1.0 = 100% on single core, so divide by number of CPUs
+				stats.CPUPercent = (load / float64(runtime.NumCPU())) * 100
+				if stats.CPUPercent > 100 {
+					stats.CPUPercent = 100
+				}
+			}
+		}
+	}
+
+	return stats
+}
+
+// getProcessMemoryMB returns current process memory usage in MB
+func getProcessMemoryMB() float64 {
+	if data, err := ioutil.ReadFile("/proc/self/status"); err == nil {
+		lines := strings.Split(string(data), "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "VmRSS:") {
+				if fields := strings.Fields(line); len(fields) >= 2 {
+					if kb, err := strconv.ParseFloat(fields[1], 64); err == nil {
+						return kb / 1024 // Convert KB to MB
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
 // parseTrafficPattern parses a CSV file with traffic configuration
 func parseTrafficPattern(filename string) ([]TrafficConfig, error) {
 	file, err := os.Open(filename)
@@ -489,8 +556,9 @@ func createCacheClientForRun(cacheType string, cmd *cobra.Command) (CacheClient,
 	case "momento":
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
 		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
-		createCache, _ := cmd.Flags().GetBool("momento-create-cache")
-		client, err := NewMomentoClient(apiKey, cacheName, createCache)
+		defaultTTL, _ := cmd.Flags().GetInt("default-ttl")
+		// Don't create cache per worker - it should be created once upfront
+		client, err := NewMomentoClient(apiKey, cacheName, false, defaultTTL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Momento client: %w", err)
 		}
@@ -508,6 +576,7 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	rps, _ := cmd.Flags().GetInt("rps")
 	timeoutSeconds, _ := cmd.Flags().GetInt("timeout")
 	verbose, _ := cmd.Flags().GetBool("verbose")
+	quiet, _ := cmd.Flags().GetBool("quiet")
 
 	// Workload parameters
 	zipfExp, _ := cmd.Flags().GetFloat64("key-zipf-exp")
@@ -525,6 +594,7 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	// Data parameters
 	dataSize, _ := cmd.Flags().GetInt("data-size")
 	randomData, _ := cmd.Flags().GetBool("random-data")
+	defaultTTL, _ := cmd.Flags().GetInt("default-ttl")
 
 	// Parse and validate parameters
 	setRatio, getRatio, err := parseRatio(ratioStr)
@@ -571,6 +641,22 @@ func runWorkload(cmd *cobra.Command, args []string) {
 
 	fmt.Printf("Logging metrics to: %s\n", csvOutput)
 
+	// For Momento, create cache once upfront to avoid spam
+	if cacheType == "momento" {
+		apiKey, _ := cmd.Flags().GetString("momento-api-key")
+		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
+		createCache, _ := cmd.Flags().GetBool("momento-create-cache")
+
+		if createCache {
+			// Create a temporary client just to create the cache
+			tempClient, err := NewMomentoClient(apiKey, cacheName, true, defaultTTL)
+			if err != nil {
+				log.Fatalf("Failed to create Momento cache: %v", err)
+			}
+			tempClient.Close()
+		}
+	}
+
 	fmt.Printf("Starting %s workload run...\n", cacheType)
 	fmt.Printf("Clients: %d\n", clientCount)
 	fmt.Printf("Test duration: %d seconds\n", testTime)
@@ -589,17 +675,17 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	if trafficPatternFile != "" {
 		// Use dynamic traffic pattern
 		runDynamicWorkload(cmd, trafficPatternFile, cacheType, zipfExp, ratioStr, keyPrefix, keyMin,
-			totalKeys, dataSize, randomData, measureSetup, verbose, timeoutSeconds, stats)
+			totalKeys, dataSize, randomData, defaultTTL, measureSetup, verbose, quiet, timeoutSeconds, stats)
 	} else {
 		// Use static configuration - run the original logic
 		runStaticWorkload(cmd, cacheType, clientCount, rps, zipfExp, ratioStr, keyPrefix, keyMin,
-			totalKeys, dataSize, randomData, measureSetup, verbose, timeoutSeconds, testTime, stats)
+			totalKeys, dataSize, randomData, defaultTTL, measureSetup, verbose, quiet, timeoutSeconds, testTime, stats)
 	}
 }
 
 // runStaticWorkload runs the original static workload logic
 func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps int, zipfExp float64,
-	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData, measureSetup, verbose bool,
+	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData bool, defaultTTL int, measureSetup, verbose, quiet bool,
 	timeoutSeconds, testTime int, stats *WorkloadStats) {
 
 	// Parse ratio
@@ -612,6 +698,7 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 	generator := &DataGenerator{
 		DataSize:   dataSize,
 		RandomData: randomData,
+		DefaultTTL: defaultTTL,
 	}
 
 	// Create context with timeout
@@ -636,7 +723,7 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 		// Let each worker create its own connection in parallel
 		go runWorkerWithConnectionCreation(ctx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
 			generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
-			timeoutSeconds, measureSetup, verbose)
+			timeoutSeconds, measureSetup, verbose, quiet)
 	}
 
 	totalSetupTime := time.Since(setupStart)
@@ -653,13 +740,13 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 	wg.Wait()
 
 	// Clear progress line and print final results
-	fmt.Print("\r" + strings.Repeat(" ", 120) + "\r")
+	fmt.Print("\r" + strings.Repeat(" ", 150) + "\r")
 	printFinalResults(stats, testTime, measureSetup)
 }
 
 // runDynamicWorkload runs workload with dynamic traffic patterns
 func runDynamicWorkload(cmd *cobra.Command, trafficPatternFile, cacheType string, zipfExp float64,
-	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData, measureSetup, verbose bool,
+	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData bool, defaultTTL int, measureSetup, verbose, quiet bool,
 	timeoutSeconds int, stats *WorkloadStats) {
 
 	// Parse traffic pattern
@@ -678,6 +765,7 @@ func runDynamicWorkload(cmd *cobra.Command, trafficPatternFile, cacheType string
 	generator := &DataGenerator{
 		DataSize:   dataSize,
 		RandomData: randomData,
+		DefaultTTL: defaultTTL,
 	}
 
 	fmt.Printf("Starting dynamic workload with %d traffic configurations...\n", len(trafficConfigs))
@@ -703,7 +791,7 @@ func runDynamicWorkload(cmd *cobra.Command, trafficPatternFile, cacheType string
 
 	// Start traffic pattern manager
 	go manageTrafficPattern(ctx, trafficConfigs, cacheType, cmd, generator, stats,
-		setRatio, getRatio, keyPrefix, keyMin, totalKeys, zipfExp, measureSetup, verbose, timeoutSeconds)
+		setRatio, getRatio, keyPrefix, keyMin, totalKeys, zipfExp, measureSetup, verbose, quiet, timeoutSeconds)
 
 	// Start progress reporting
 	go reportProgress(ctx, stats, verbose)
@@ -787,8 +875,11 @@ func runWorkerInternal(ctx context.Context, workerID int, client CacheClient,
 				continue
 			}
 
+			// Get expiration from generator (uses DefaultTTL if set)
+			expiration := generator.GetExpiration()
+
 			start := time.Now()
-			err = client.Set(opCtx, key, data, 0) // No expiration for workload
+			err = client.Set(opCtx, key, data, expiration)
 			latency := time.Since(start)
 			cancel()
 
@@ -824,7 +915,7 @@ func runWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, wo
 	cacheType string, cmd *cobra.Command, totalKeys int, zipfExp float64,
 	generator *DataGenerator, stats *WorkloadStats, setRatio, getRatio int,
 	keyPrefix string, keyMin int, limiter *rate.Limiter, timeoutSeconds int,
-	measureSetup, verbose bool) {
+	measureSetup, verbose, quiet bool) {
 
 	defer wg.Done()
 
@@ -844,7 +935,7 @@ func runWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, wo
 		return
 	}
 
-	if verbose {
+	if verbose && !quiet {
 		log.Printf("Worker %d: Successfully created client connection", workerID)
 	}
 
@@ -857,7 +948,7 @@ func runWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, wo
 func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheType string,
 	cmd *cobra.Command, generator *DataGenerator, stats *WorkloadStats,
 	setRatio, getRatio int, keyPrefix string, keyMin, totalKeys int, zipfExp float64,
-	measureSetup, verbose bool, timeoutSeconds int) {
+	measureSetup, verbose, quiet bool, timeoutSeconds int) {
 
 	var activeWorkers []context.CancelFunc
 	var wg sync.WaitGroup
@@ -930,7 +1021,7 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 				// Pass connection creation parameters to worker - let it create connection in parallel
 				go runWorkerWithConnectionCreation(workerCtx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
 					generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
-					timeoutSeconds, measureSetup, verbose)
+					timeoutSeconds, measureSetup, verbose, quiet)
 			}
 
 			fmt.Printf("  Successfully initiated %d new workers\n", newWorkers)
@@ -960,7 +1051,7 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 		select {
 		case <-ctx.Done():
 			// Clear the progress line and print final newline
-			fmt.Print("\r" + strings.Repeat(" ", 120) + "\r")
+			fmt.Print("\r" + strings.Repeat(" ", 150) + "\r")
 			return
 		case <-ticker.C:
 			getOps := atomic.LoadInt64(&stats.GetOps)
@@ -1015,13 +1106,19 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 					stats.CSVLogger.LogMetrics(snapshot)
 				}
 
-				// Format the progress line (clear line first, then write)
-				progressLine := fmt.Sprintf("\r%s | %d clients | %.0f ops/s | GET: %.0f/s | SET: %.0f/s",
-					progressBar, currentClients, totalQPS, getQPS, setQPS)
+				// Get system resource usage
+				sysStats := getSystemStats()
+				procMemMB := getProcessMemoryMB()
+
+				// Format the progress line with resource monitoring
+				progressLine := fmt.Sprintf("\r%s | %d clients | %.0f ops/s | GET: %.0f/s | SET: %.0f/s | Mem: %.1fGB/%.1fGB | CPU: %.0f%% | Proc: %.1fGB",
+					progressBar, currentClients, totalQPS, getQPS, setQPS,
+					sysStats.MemoryUsedMB/1024, sysStats.MemoryTotalMB/1024,
+					sysStats.CPUPercent, procMemMB/1024)
 
 				// Truncate if too long for terminal
-				if len(progressLine) > 120 {
-					progressLine = progressLine[:117] + "..."
+				if len(progressLine) > 150 {
+					progressLine = progressLine[:147] + "..."
 				}
 
 				fmt.Print(progressLine)
@@ -1105,7 +1202,7 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 		select {
 		case <-ctx.Done():
 			// Clear the progress line
-			fmt.Print("\r" + strings.Repeat(" ", 120) + "\r")
+			fmt.Print("\r" + strings.Repeat(" ", 150) + "\r")
 			return
 		case <-ticker.C:
 			getOps := atomic.LoadInt64(&stats.GetOps)
@@ -1156,13 +1253,19 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 				// Create progress bar for static workload
 				progressBar := createStaticProgressBar(elapsed, totalDuration)
 
-				// Format the progress line
-				progressLine := fmt.Sprintf("\r%s | %d clients | %.0f ops/s | GET: %.0f/s | SET: %.0f/s",
-					progressBar, clientCount, totalQPS, getQPS, setQPS)
+				// Get system resource usage
+				sysStats := getSystemStats()
+				procMemMB := getProcessMemoryMB()
+
+				// Format the progress line with resource monitoring
+				progressLine := fmt.Sprintf("\r%s | %d clients | %.0f ops/s | GET: %.0f/s | SET: %.0f/s | Mem: %.1fGB/%.1fGB | CPU: %.0f%% | Proc: %.1fGB",
+					progressBar, clientCount, totalQPS, getQPS, setQPS,
+					sysStats.MemoryUsedMB/1024, sysStats.MemoryTotalMB/1024,
+					sysStats.CPUPercent, procMemMB/1024)
 
 				// Truncate if too long for terminal
-				if len(progressLine) > 120 {
-					progressLine = progressLine[:117] + "..."
+				if len(progressLine) > 150 {
+					progressLine = progressLine[:147] + "..."
 				}
 
 				fmt.Print(progressLine)
@@ -1376,6 +1479,8 @@ func init() {
 	runCmd.Flags().Bool("measure-setup", true, "Measure client setup time including ping/connectivity test")
 	runCmd.Flags().String("traffic-pattern", "", "CSV file with traffic pattern (time_seconds,clients,qps). Overrides --clients and --rps")
 	runCmd.Flags().String("csv-output", "", "CSV file to log performance metrics (default: auto-generated filename)")
+	runCmd.Flags().Bool("quiet", false, "Suppress verbose output and worker creation logs")
+	runCmd.Flags().Int("default-ttl", 3600, "Default TTL in seconds for cache entries (0 = no expiration for Redis, 60s minimum for Momento)")
 
 	// Key Options
 	runCmd.Flags().String("key-prefix", "memtier-", "Prefix for keys")
