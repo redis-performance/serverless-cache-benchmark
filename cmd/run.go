@@ -659,6 +659,7 @@ func createCacheClientForRun(cacheType string, cmd *cobra.Command) (CacheClient,
 	switch cacheType {
 	case "redis":
 		uri, _ := cmd.Flags().GetString("redis-uri")
+		clusterMode, _ := cmd.Flags().GetBool("cluster-mode")
 
 		// Build Redis configuration from flags
 		dialTimeout, _ := cmd.Flags().GetInt("redis-dial-timeout")
@@ -679,6 +680,7 @@ func createCacheClientForRun(cacheType string, cmd *cobra.Command) (CacheClient,
 			MaxRetries:      maxRetries,
 			MinRetryBackoff: time.Duration(minRetryBackoff) * time.Millisecond,
 			MaxRetryBackoff: time.Duration(maxRetryBackoff) * time.Millisecond,
+			ClusterMode:     clusterMode,
 		}
 
 		client, err := NewRedisClientFromURI(uri, config)
@@ -1619,6 +1621,7 @@ func init() {
 
 	// Redis Options (reuse from populate)
 	runCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI")
+	runCmd.Flags().Bool("cluster-mode", false, "Run client in cluster mode")
 	runCmd.Flags().Int("redis-dial-timeout", 10, "Redis dial timeout in seconds")
 	runCmd.Flags().Int("redis-read-timeout", 10, "Redis read timeout in seconds")
 	runCmd.Flags().Int("redis-write-timeout", 10, "Redis write timeout in seconds")
