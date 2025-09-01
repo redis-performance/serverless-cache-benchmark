@@ -62,8 +62,6 @@ func NewMomentoClient(apiKey, cacheName string, createCache bool, defaultTTLSeco
 			if !strings.Contains(err.Error(), "already exists") && !strings.Contains(err.Error(), "AlreadyExists") {
 				log.Printf("Warning: Failed to create cache '%s': %v", cacheName, err)
 			}
-		} else {
-			fmt.Printf("Momento cache ready: %s\n", cacheName)
 		}
 	}
 
