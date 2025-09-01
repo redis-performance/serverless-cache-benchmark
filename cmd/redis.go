@@ -12,13 +12,33 @@ type RedisClient struct {
 	client *redis.Client
 }
 
-func NewRedisClientFromURI(uri string) (*RedisClient, error) {
+// RedisConfig holds Redis connection configuration
+type RedisConfig struct {
+	DialTimeout     time.Duration
+	ReadTimeout     time.Duration
+	WriteTimeout    time.Duration
+	PoolTimeout     time.Duration
+	ConnMaxIdleTime time.Duration
+	MaxRetries      int
+	MinRetryBackoff time.Duration
+	MaxRetryBackoff time.Duration
+}
+
+func NewRedisClientFromURI(uri string, config RedisConfig) (*RedisClient, error) {
 	opts, err := redis.ParseURL(uri)
 	if err != nil {
 		return nil, err
 	}
-	opts.ConnMaxIdleTime = 5 * time.Second
-	opts.PoolTimeout = 5 * time.Second
+	// Apply configurable timeouts and retry settings
+	opts.DialTimeout = config.DialTimeout
+	opts.ReadTimeout = config.ReadTimeout
+	opts.WriteTimeout = config.WriteTimeout
+	opts.ConnMaxIdleTime = config.ConnMaxIdleTime
+	opts.PoolTimeout = config.PoolTimeout
+	opts.MaxRetries = config.MaxRetries
+	opts.MinRetryBackoff = config.MinRetryBackoff
+	opts.MaxRetryBackoff = config.MaxRetryBackoff
+
 	rdb := redis.NewClient(opts)
 	return &RedisClient{client: rdb}, nil
 }

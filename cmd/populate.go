@@ -47,7 +47,10 @@ Examples:
   serverless-cache-benchmark populate --cache-type momento --momento-cache-name test-cache --rps 1000
 
   # Populate with 4 clients at 500 RPS (125 RPS per client)
-  serverless-cache-benchmark populate --cache-type redis --redis-uri redis://localhost:6379 --clients 4 --rps 500`,
+  serverless-cache-benchmark populate --cache-type redis --redis-uri redis://localhost:6379 --clients 4 --rps 500
+
+  # Populate with custom Redis timeouts for high-load scenarios
+  serverless-cache-benchmark populate --cache-type redis --redis-dial-timeout 30 --redis-read-timeout 30 --redis-max-retries 5`,
 	Run: runPopulate,
 }
 
@@ -63,9 +66,12 @@ type ClientWorker struct {
 }
 
 // workerRoutine runs a single client worker with rate limiting and channel-based stats
-func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, keyPrefix string) {
+func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, keyPrefix string, verbose bool, timeoutSeconds int) {
 	defer wg.Done()
 	defer cw.Client.Close()
+
+	var errorCount int64
+	const maxErrorsToLog = 10 // Limit error logging to prevent spam
 
 	for i := cw.KeyStart; i <= cw.KeyEnd; i++ {
 		select {
@@ -78,7 +84,9 @@ func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, k
 		if cw.Limiter != nil {
 			err := cw.Limiter.Wait(ctx)
 			if err != nil {
-				log.Printf("Client %d: Rate limiter error: %v", cw.ID, err)
+				if verbose && errorCount < maxErrorsToLog {
+					log.Printf("Client %d: Rate limiter error: %v", cw.ID, err)
+				}
 				return
 			}
 		}
@@ -87,25 +95,40 @@ func (cw *ClientWorker) workerRoutine(ctx context.Context, wg *sync.WaitGroup, k
 
 		data, err := cw.Generator.GenerateData()
 		if err != nil {
-			log.Printf("Client %d: Failed to generate data for key %s: %v", cw.ID, key, err)
+			if verbose && errorCount < maxErrorsToLog {
+				log.Printf("Client %d: Failed to generate data for key %s: %v", cw.ID, key, err)
+			}
 			cw.Stats.RecordError()
+			errorCount++
 			continue
 		}
 
 		expiration := cw.Generator.GetExpiration()
 
+		// Create a timeout context for this operation
+		opCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
 		start := time.Now()
-		err = cw.Client.Set(ctx, key, data, expiration)
+		err = cw.Client.Set(opCtx, key, data, expiration)
 		latency := time.Since(start)
+		cancel()
 
 		if err != nil {
-			log.Printf("Client %d: Failed to set key %s: %v", cw.ID, key, err)
+			if verbose && errorCount < maxErrorsToLog {
+				log.Printf("Client %d: Failed to set key %s: %v", cw.ID, key, err)
+			} else if errorCount == maxErrorsToLog {
+				log.Printf("Client %d: Suppressing further error logs (too many errors)", cw.ID)
+			}
 			cw.Stats.RecordError()
+			errorCount++
 			continue
 		}
 
 		// Channel-based stats recording (lock-free, non-blocking)
 		cw.Stats.RecordLatency(latency.Microseconds())
+	}
+
+	if errorCount > 0 && !verbose {
+		log.Printf("Client %d: Completed with %d errors", cw.ID, errorCount)
 	}
 }
 
@@ -114,7 +137,29 @@ func createCacheClient(cacheType string, cmd *cobra.Command) (CacheClient, error
 	switch cacheType {
 	case "redis":
 		uri, _ := cmd.Flags().GetString("redis-uri")
-		client, err := NewRedisClientFromURI(uri)
+
+		// Build Redis configuration from flags
+		dialTimeout, _ := cmd.Flags().GetInt("redis-dial-timeout")
+		readTimeout, _ := cmd.Flags().GetInt("redis-read-timeout")
+		writeTimeout, _ := cmd.Flags().GetInt("redis-write-timeout")
+		poolTimeout, _ := cmd.Flags().GetInt("redis-pool-timeout")
+		connMaxIdleTime, _ := cmd.Flags().GetInt("redis-conn-max-idle-time")
+		maxRetries, _ := cmd.Flags().GetInt("redis-max-retries")
+		minRetryBackoff, _ := cmd.Flags().GetInt("redis-min-retry-backoff")
+		maxRetryBackoff, _ := cmd.Flags().GetInt("redis-max-retry-backoff")
+
+		config := RedisConfig{
+			DialTimeout:     time.Duration(dialTimeout) * time.Second,
+			ReadTimeout:     time.Duration(readTimeout) * time.Second,
+			WriteTimeout:    time.Duration(writeTimeout) * time.Second,
+			PoolTimeout:     time.Duration(poolTimeout) * time.Second,
+			ConnMaxIdleTime: time.Duration(connMaxIdleTime) * time.Second,
+			MaxRetries:      maxRetries,
+			MinRetryBackoff: time.Duration(minRetryBackoff) * time.Millisecond,
+			MaxRetryBackoff: time.Duration(maxRetryBackoff) * time.Millisecond,
+		}
+
+		client, err := NewRedisClientFromURI(uri, config)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Redis client from URI '%s': %w", uri, err)
 		}
@@ -155,6 +200,7 @@ func runPopulate(cmd *cobra.Command, args []string) {
 	cacheType, _ := cmd.Flags().GetString("cache-type")
 	clientCount, _ := cmd.Flags().GetInt("clients")
 	rps, _ := cmd.Flags().GetInt("rps")
+	timeoutSeconds, _ := cmd.Flags().GetInt("timeout")
 	verbose, _ := cmd.Flags().GetBool("verbose")
 
 	// Get populate parameters
@@ -292,7 +338,7 @@ func runPopulate(cmd *cobra.Command, args []string) {
 
 	for i, worker := range workers {
 		wg.Add(1)
-		go worker.workerRoutine(ctx, &wg, keyPrefix)
+		go worker.workerRoutine(ctx, &wg, keyPrefix, verbose, timeoutSeconds)
 		if verbose {
 			fmt.Printf("Started worker %d\n", i)
 		}
@@ -318,10 +364,19 @@ func init() {
 	defaultClients := runtime.NumCPU()
 	populateCmd.Flags().IntP("clients", "c", defaultClients, "Number of concurrent clients (default: 4, optimized for I/O)")
 	populateCmd.Flags().IntP("rps", "r", 0, "Rate limit in requests per second (0 = unlimited)")
+	populateCmd.Flags().IntP("timeout", "T", 10, "Operation timeout in seconds")
 	populateCmd.Flags().BoolP("verbose", "v", false, "Enable verbose output (show worker details)")
 
 	// Redis Options
 	populateCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI (redis://[username[:password]@]host[:port][/db-number] or rediss:// for TLS)")
+	populateCmd.Flags().Int("redis-dial-timeout", 30, "Redis dial timeout in seconds")
+	populateCmd.Flags().Int("redis-read-timeout", 30, "Redis read timeout in seconds")
+	populateCmd.Flags().Int("redis-write-timeout", 30, "Redis write timeout in seconds")
+	populateCmd.Flags().Int("redis-pool-timeout", 30, "Redis connection pool timeout in seconds")
+	populateCmd.Flags().Int("redis-conn-max-idle-time", 30, "Redis connection max idle time in seconds")
+	populateCmd.Flags().Int("redis-max-retries", 3, "Redis maximum number of retries")
+	populateCmd.Flags().Int("redis-min-retry-backoff", 1000, "Redis minimum retry backoff in milliseconds")
+	populateCmd.Flags().Int("redis-max-retry-backoff", 10000, "Redis maximum retry backoff in milliseconds")
 
 	// Momento Options
 	populateCmd.Flags().String("momento-api-key", "", "Momento API key (or set MOMENTO_API_KEY env var)")
