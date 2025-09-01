@@ -155,6 +155,7 @@ func runPopulate(cmd *cobra.Command, args []string) {
 	cacheType, _ := cmd.Flags().GetString("cache-type")
 	clientCount, _ := cmd.Flags().GetInt("clients")
 	rps, _ := cmd.Flags().GetInt("rps")
+	verbose, _ := cmd.Flags().GetBool("verbose")
 
 	// Get populate parameters
 	dataSize, _ := cmd.Flags().GetInt("data-size")
@@ -251,7 +252,9 @@ func runPopulate(cmd *cobra.Command, args []string) {
 			KeyEnd:    end,
 		}
 
-		fmt.Printf("Worker %d: keys %d to %d (%d keys)\n", i, start, end, end-start+1)
+		if verbose {
+			fmt.Printf("Worker %d: keys %d to %d (%d keys)\n", i, start, end, end-start+1)
+		}
 	}
 
 	// Start progress reporting goroutine with reduced frequency to minimize overhead
@@ -281,11 +284,18 @@ func runPopulate(cmd *cobra.Command, args []string) {
 	}()
 
 	// Start all workers
-	fmt.Println("\nStarting workers...")
+	if verbose {
+		fmt.Println("\nStarting workers...")
+	} else {
+		fmt.Printf("\nStarting %d workers...\n", clientCount)
+	}
+
 	for i, worker := range workers {
 		wg.Add(1)
 		go worker.workerRoutine(ctx, &wg, keyPrefix)
-		fmt.Printf("Started worker %d\n", i)
+		if verbose {
+			fmt.Printf("Started worker %d\n", i)
+		}
 	}
 
 	// Wait for all workers to complete
@@ -308,6 +318,7 @@ func init() {
 	defaultClients := runtime.NumCPU()
 	populateCmd.Flags().IntP("clients", "c", defaultClients, "Number of concurrent clients (default: 4, optimized for I/O)")
 	populateCmd.Flags().IntP("rps", "r", 0, "Rate limit in requests per second (0 = unlimited)")
+	populateCmd.Flags().BoolP("verbose", "v", false, "Enable verbose output (show worker details)")
 
 	// Redis Options
 	populateCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI (redis://[username[:password]@]host[:port][/db-number] or rediss:// for TLS)")
