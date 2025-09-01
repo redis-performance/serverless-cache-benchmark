@@ -1,0 +1,13 @@
+# Staircase traffic pattern for testing
+# Format: time_seconds,clients,qps
+# Each step lasts 3 minutes (180s), total = 30 minutes
+time_seconds,clients,qps
+0,100,-1
+180,1000,-1
+360,10000,-1
+540,20000,-1
+720,40000,-1
+900,60000,-1
+1080,80000,-1
+1260,100000,-1
+1800,100000,-1

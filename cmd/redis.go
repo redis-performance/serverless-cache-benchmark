@@ -56,6 +56,18 @@ func (r *RedisClient) Set(ctx context.Context, key string, value []byte, expirat
 	return r.client.Set(ctx, key, value, expiration).Err()
 }
 
+func (r *RedisClient) Get(ctx context.Context, key string) ([]byte, error) {
+	result, err := r.client.Get(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+	return []byte(result), nil
+}
+
+func (r *RedisClient) Ping(ctx context.Context) error {
+	return r.client.Ping(ctx).Err()
+}
+
 func (r *RedisClient) Close() error {
 	return r.client.Close()
 }

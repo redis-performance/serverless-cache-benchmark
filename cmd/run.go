@@ -4,36 +4,973 @@ Copyright © 2025 Redis Performance Group  <performance <at> redis <dot> com>
 package cmd
 
 import (
+	"context"
+	"encoding/csv"
 	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"os"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/time/rate"
 )
+
+// ZipfGenerator generates keys following Zipf distribution
+type ZipfGenerator struct {
+	zipf *rand.Zipf
+	max  uint64
+}
+
+func NewZipfGenerator(max uint64, exponent float64, seed int64) *ZipfGenerator {
+	if exponent <= 0 || exponent > 5 {
+		exponent = 1.0 // Default safe value
+	}
+
+	// Ensure max is at least 1
+	if max < 1 {
+		max = 1
+	}
+
+	source := rand.NewSource(seed)
+	rng := rand.New(source)
+
+	// The Go Zipf implementation can return nil in some cases
+	// Let's add some debugging and fallback
+	zipf := rand.NewZipf(rng, exponent, 1, max)
+	if zipf == nil {
+		// Fallback: try with different parameters
+		zipf = rand.NewZipf(rng, 1.1, 1, max)
+		if zipf == nil {
+			// Last resort: use uniform distribution
+			fmt.Printf("Warning: Zipf generator failed, falling back to uniform distribution\n")
+		}
+	}
+
+	return &ZipfGenerator{
+		zipf: zipf,
+		max:  max,
+	}
+}
+
+func (zg *ZipfGenerator) Next() uint64 {
+	if zg.zipf == nil {
+		// Fallback to uniform distribution
+		return uint64(rand.Intn(int(zg.max))) + 1
+	}
+	return zg.zipf.Uint64()
+}
+
+// TrafficConfig represents a traffic configuration at a specific time
+type TrafficConfig struct {
+	TimeSeconds int
+	Clients     int
+	QPS         int // -1 means unlimited
+}
+
+// TimeBlockStats tracks actual performance during a time block
+type TimeBlockStats struct {
+	Config       TrafficConfig
+	StartTime    time.Time
+	EndTime      time.Time
+	ActualGetOps int64
+	ActualSetOps int64
+	GetErrors    int64
+	SetErrors    int64
+	GetStats     *PerformanceStats
+	SetStats     *PerformanceStats
+}
+
+// WorkloadStats tracks workload performance metrics
+type WorkloadStats struct {
+	GetOps       int64
+	SetOps       int64
+	GetErrors    int64
+	SetErrors    int64
+	GetStats     *PerformanceStats
+	SetStats     *PerformanceStats
+	SetupStats   *PerformanceStats // For client setup time measurement
+	TimeBlocks   []TimeBlockStats  // Performance per time block
+	CurrentBlock *TimeBlockStats   // Currently active time block
+	BlockMutex   sync.RWMutex      // Protects time block operations
+}
+
+func NewWorkloadStats() *WorkloadStats {
+	return &WorkloadStats{
+		GetStats:   NewPerformanceStats(),
+		SetStats:   NewPerformanceStats(),
+		SetupStats: NewPerformanceStats(),
+		TimeBlocks: make([]TimeBlockStats, 0),
+	}
+}
+
+// StartTimeBlock starts tracking a new time block
+func (ws *WorkloadStats) StartTimeBlock(config TrafficConfig) {
+	ws.BlockMutex.Lock()
+	defer ws.BlockMutex.Unlock()
+
+	// Finish current block if exists
+	if ws.CurrentBlock != nil {
+		ws.CurrentBlock.EndTime = time.Now()
+		ws.TimeBlocks = append(ws.TimeBlocks, *ws.CurrentBlock)
+	}
+
+	// Start new block
+	ws.CurrentBlock = &TimeBlockStats{
+		Config:    config,
+		StartTime: time.Now(),
+		GetStats:  NewPerformanceStats(),
+		SetStats:  NewPerformanceStats(),
+	}
+}
+
+// FinishCurrentTimeBlock finishes the current time block
+func (ws *WorkloadStats) FinishCurrentTimeBlock() {
+	ws.BlockMutex.Lock()
+	defer ws.BlockMutex.Unlock()
+
+	if ws.CurrentBlock != nil {
+		ws.CurrentBlock.EndTime = time.Now()
+		ws.TimeBlocks = append(ws.TimeBlocks, *ws.CurrentBlock)
+		ws.CurrentBlock = nil
+	}
+}
+
+// RecordOperationInBlock records an operation in the current time block
+func (ws *WorkloadStats) RecordOperationInBlock(isSet bool, latencyMicros int64, isError bool) {
+	ws.BlockMutex.RLock()
+	defer ws.BlockMutex.RUnlock()
+
+	if ws.CurrentBlock == nil {
+		return
+	}
+
+	if isSet {
+		if isError {
+			atomic.AddInt64(&ws.CurrentBlock.SetErrors, 1)
+		} else {
+			atomic.AddInt64(&ws.CurrentBlock.ActualSetOps, 1)
+			ws.CurrentBlock.SetStats.RecordLatency(latencyMicros)
+		}
+	} else {
+		if isError {
+			atomic.AddInt64(&ws.CurrentBlock.GetErrors, 1)
+		} else {
+			atomic.AddInt64(&ws.CurrentBlock.ActualGetOps, 1)
+			ws.CurrentBlock.GetStats.RecordLatency(latencyMicros)
+		}
+	}
+}
 
 // runCmd represents the run command
 var runCmd = &cobra.Command{
 	Use:   "run",
-	Short: "A brief description of your command",
-	Long: `A longer description that spans multiple lines and likely contains examples
-and usage of using your command. For example:
+	Short: "Run cache workload with configurable access patterns",
+	Long: `Run cache workload tests with configurable access patterns including Zipf distribution,
+Set:Get ratios, and time-based testing.
 
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("run called")
-	},
+This command runs a mixed workload against Redis or Momento cache systems with realistic
+access patterns using Zipf distribution for key selection and configurable Set:Get ratios.
+
+Examples:
+  # Run basic workload for 60 seconds with default Zipf distribution
+  serverless-cache-benchmark run --cache-type redis --test-time 60
+
+  # Run with high key concentration (Zipf exponent 2.0) and 1:5 Set:Get ratio
+  serverless-cache-benchmark run --cache-type redis --key-zipf-exp 2.0 --ratio 1:5 --test-time 120
+
+  # Run with custom key range and clients
+  serverless-cache-benchmark run --cache-type redis --key-maximum 1000000 --clients 8 --test-time 300
+
+  # Run with dynamic traffic pattern from CSV file
+  serverless-cache-benchmark run --cache-type redis --traffic-pattern traffic.csv`,
+	Run: runWorkload,
+}
+
+// parseRatio parses Set:Get ratio string like "1:10"
+func parseRatio(ratioStr string) (int, int, error) {
+	parts := strings.Split(ratioStr, ":")
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("invalid ratio format, expected 'set:get' like '1:10'")
+	}
+
+	setRatio, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid set ratio: %w", err)
+	}
+
+	getRatio, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid get ratio: %w", err)
+	}
+
+	if setRatio < 0 || getRatio < 0 {
+		return 0, 0, fmt.Errorf("ratios must be non-negative")
+	}
+
+	return setRatio, getRatio, nil
+}
+
+// parseTrafficPattern parses a CSV file with traffic configuration
+func parseTrafficPattern(filename string) ([]TrafficConfig, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open traffic pattern file: %w", err)
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	reader.Comment = '#'
+	reader.TrimLeadingSpace = true
+
+	var configs []TrafficConfig
+	lineNum := 0
+
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("error reading CSV line %d: %w", lineNum+1, err)
+		}
+
+		lineNum++
+
+		// Skip header line if it looks like one
+		if lineNum == 1 && (strings.ToLower(record[0]) == "time_seconds" || strings.ToLower(record[0]) == "time") {
+			continue
+		}
+
+		if len(record) != 3 {
+			return nil, fmt.Errorf("line %d: expected 3 columns (time_seconds,clients,qps), got %d", lineNum, len(record))
+		}
+
+		timeSeconds, err := strconv.Atoi(strings.TrimSpace(record[0]))
+		if err != nil {
+			return nil, fmt.Errorf("line %d: invalid time_seconds '%s': %w", lineNum, record[0], err)
+		}
+
+		clients, err := strconv.Atoi(strings.TrimSpace(record[1]))
+		if err != nil {
+			return nil, fmt.Errorf("line %d: invalid clients '%s': %w", lineNum, record[1], err)
+		}
+
+		qpsStr := strings.TrimSpace(record[2])
+		var qps int
+		if qpsStr == "-1" || strings.ToLower(qpsStr) == "unlimited" {
+			qps = -1
+		} else {
+			qps, err = strconv.Atoi(qpsStr)
+			if err != nil {
+				return nil, fmt.Errorf("line %d: invalid qps '%s': %w", lineNum, record[2], err)
+			}
+		}
+
+		if timeSeconds < 0 {
+			return nil, fmt.Errorf("line %d: time_seconds cannot be negative", lineNum)
+		}
+		if clients < 0 {
+			return nil, fmt.Errorf("line %d: clients cannot be negative", lineNum)
+		}
+		if qps < -1 {
+			return nil, fmt.Errorf("line %d: qps cannot be less than -1", lineNum)
+		}
+
+		configs = append(configs, TrafficConfig{
+			TimeSeconds: timeSeconds,
+			Clients:     clients,
+			QPS:         qps,
+		})
+	}
+
+	if len(configs) == 0 {
+		return nil, fmt.Errorf("no valid traffic configurations found in file")
+	}
+
+	// Sort by time to ensure proper ordering
+	for i := 0; i < len(configs)-1; i++ {
+		for j := i + 1; j < len(configs); j++ {
+			if configs[i].TimeSeconds > configs[j].TimeSeconds {
+				configs[i], configs[j] = configs[j], configs[i]
+			}
+		}
+	}
+
+	return configs, nil
+}
+
+// createAndTestCacheClient creates a cache client and measures setup time including ping
+func createAndTestCacheClient(cacheType string, cmd *cobra.Command, stats *WorkloadStats) (CacheClient, error) {
+	setupStart := time.Now()
+
+	// Create the client
+	client, err := createCacheClientForRun(cacheType, cmd)
+	if err != nil {
+		return nil, err
+	}
+
+	// Test connectivity with ping
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err = client.Ping(ctx)
+	if err != nil {
+		client.Close()
+		return nil, fmt.Errorf("ping failed: %w", err)
+	}
+
+	// Record setup time
+	setupTime := time.Since(setupStart)
+	stats.SetupStats.RecordLatency(setupTime.Microseconds())
+
+	return client, nil
+}
+
+// createCacheClientForRun creates a cache client for the run command (reuses populate logic)
+func createCacheClientForRun(cacheType string, cmd *cobra.Command) (CacheClient, error) {
+	switch cacheType {
+	case "redis":
+		uri, _ := cmd.Flags().GetString("redis-uri")
+
+		// Build Redis configuration from flags
+		dialTimeout, _ := cmd.Flags().GetInt("redis-dial-timeout")
+		readTimeout, _ := cmd.Flags().GetInt("redis-read-timeout")
+		writeTimeout, _ := cmd.Flags().GetInt("redis-write-timeout")
+		poolTimeout, _ := cmd.Flags().GetInt("redis-pool-timeout")
+		connMaxIdleTime, _ := cmd.Flags().GetInt("redis-conn-max-idle-time")
+		maxRetries, _ := cmd.Flags().GetInt("redis-max-retries")
+		minRetryBackoff, _ := cmd.Flags().GetInt("redis-min-retry-backoff")
+		maxRetryBackoff, _ := cmd.Flags().GetInt("redis-max-retry-backoff")
+
+		config := RedisConfig{
+			DialTimeout:     time.Duration(dialTimeout) * time.Second,
+			ReadTimeout:     time.Duration(readTimeout) * time.Second,
+			WriteTimeout:    time.Duration(writeTimeout) * time.Second,
+			PoolTimeout:     time.Duration(poolTimeout) * time.Second,
+			ConnMaxIdleTime: time.Duration(connMaxIdleTime) * time.Second,
+			MaxRetries:      maxRetries,
+			MinRetryBackoff: time.Duration(minRetryBackoff) * time.Millisecond,
+			MaxRetryBackoff: time.Duration(maxRetryBackoff) * time.Millisecond,
+		}
+
+		client, err := NewRedisClientFromURI(uri, config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Redis client from URI '%s': %w", uri, err)
+		}
+		return client, nil
+
+	case "momento":
+		apiKey, _ := cmd.Flags().GetString("momento-api-key")
+		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
+		createCache, _ := cmd.Flags().GetBool("momento-create-cache")
+		client, err := NewMomentoClient(apiKey, cacheName, createCache)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create Momento client: %w", err)
+		}
+		return client, nil
+
+	default:
+		return nil, fmt.Errorf("invalid cache type: %s. Must be 'redis' or 'momento'", cacheType)
+	}
+}
+
+func runWorkload(cmd *cobra.Command, args []string) {
+	// Get command parameters
+	cacheType, _ := cmd.Flags().GetString("cache-type")
+	clientCount, _ := cmd.Flags().GetInt("clients")
+	rps, _ := cmd.Flags().GetInt("rps")
+	timeoutSeconds, _ := cmd.Flags().GetInt("timeout")
+	verbose, _ := cmd.Flags().GetBool("verbose")
+
+	// Workload parameters
+	zipfExp, _ := cmd.Flags().GetFloat64("key-zipf-exp")
+	testTime, _ := cmd.Flags().GetInt("test-time")
+	ratioStr, _ := cmd.Flags().GetString("ratio")
+	measureSetup, _ := cmd.Flags().GetBool("measure-setup")
+	trafficPatternFile, _ := cmd.Flags().GetString("traffic-pattern")
+
+	// Key parameters
+	keyPrefix, _ := cmd.Flags().GetString("key-prefix")
+	keyMin, _ := cmd.Flags().GetInt("key-minimum")
+	keyMax, _ := cmd.Flags().GetInt("key-maximum")
+
+	// Data parameters
+	dataSize, _ := cmd.Flags().GetInt("data-size")
+	randomData, _ := cmd.Flags().GetBool("random-data")
+
+	// Parse and validate parameters
+	setRatio, getRatio, err := parseRatio(ratioStr)
+	if err != nil {
+		log.Fatalf("Invalid ratio: %v", err)
+	}
+
+	if zipfExp <= 0 || zipfExp > 5 {
+		log.Fatalf("Zipf exponent must be between 0 and 5, got: %f", zipfExp)
+	}
+
+	if testTime <= 0 {
+		log.Fatalf("Test time must be positive, got: %d", testTime)
+	}
+
+	totalKeys := keyMax - keyMin + 1
+	if totalKeys <= 0 {
+		log.Fatalf("Invalid key range: min=%d, max=%d", keyMin, keyMax)
+	}
+
+	// Create workload stats
+	stats := NewWorkloadStats()
+	defer stats.GetStats.Close()
+	defer stats.SetStats.Close()
+	defer stats.SetupStats.Close()
+
+	fmt.Printf("Starting %s workload run...\n", cacheType)
+	fmt.Printf("Clients: %d\n", clientCount)
+	fmt.Printf("Test duration: %d seconds\n", testTime)
+	fmt.Printf("Key range: %d to %d (%d total keys)\n", keyMin, keyMax, totalKeys)
+	fmt.Printf("Zipf exponent: %.2f\n", zipfExp)
+	fmt.Printf("Set:Get ratio: %d:%d\n", setRatio, getRatio)
+	if rps > 0 {
+		fmt.Printf("Rate limit: %d RPS total (%.2f RPS per client)\n", rps, float64(rps)/float64(clientCount))
+	} else {
+		fmt.Printf("Rate limit: unlimited\n")
+	}
+	fmt.Printf("Data size: %d bytes\n", dataSize)
+	fmt.Println()
+
+	// Check if using traffic pattern or static configuration
+	if trafficPatternFile != "" {
+		// Use dynamic traffic pattern
+		runDynamicWorkload(cmd, trafficPatternFile, cacheType, zipfExp, ratioStr, keyPrefix, keyMin,
+			totalKeys, dataSize, randomData, measureSetup, verbose, timeoutSeconds, stats)
+	} else {
+		// Use static configuration - run the original logic
+		runStaticWorkload(cmd, cacheType, clientCount, rps, zipfExp, ratioStr, keyPrefix, keyMin,
+			totalKeys, dataSize, randomData, measureSetup, verbose, timeoutSeconds, testTime, stats)
+	}
+}
+
+// runStaticWorkload runs the original static workload logic
+func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps int, zipfExp float64,
+	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData, measureSetup, verbose bool,
+	timeoutSeconds, testTime int, stats *WorkloadStats) {
+
+	// Parse ratio
+	setRatio, getRatio, err := parseRatio(ratioStr)
+	if err != nil {
+		log.Fatalf("Invalid ratio: %v", err)
+	}
+
+	// Create data generator
+	generator := &DataGenerator{
+		DataSize:   dataSize,
+		RandomData: randomData,
+	}
+
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(testTime)*time.Second)
+	defer cancel()
+
+	// Create workers
+	var wg sync.WaitGroup
+
+	fmt.Printf("Setting up %d clients...\n", clientCount)
+	setupStart := time.Now()
+
+	for i := 0; i < clientCount; i++ {
+		var client CacheClient
+		var err error
+
+		if measureSetup {
+			// Create cache client with setup time measurement
+			client, err = createAndTestCacheClient(cacheType, cmd, stats)
+			if err != nil {
+				log.Fatalf("Failed to create and test cache client for worker %d: %v", i, err)
+			}
+		} else {
+			// Create cache client without measurement
+			client, err = createCacheClientForRun(cacheType, cmd)
+			if err != nil {
+				log.Fatalf("Failed to create cache client for worker %d: %v", i, err)
+			}
+		}
+
+		// Create rate limiter for this client if specified
+		var limiter *rate.Limiter
+		if rps > 0 {
+			clientRPS := float64(rps) / float64(clientCount)
+			limiter = rate.NewLimiter(rate.Limit(clientRPS), 1)
+		}
+
+		wg.Add(1)
+		go runWorker(ctx, &wg, i, client, totalKeys, zipfExp, generator, stats,
+			setRatio, getRatio, keyPrefix, keyMin, limiter, timeoutSeconds, verbose)
+	}
+
+	totalSetupTime := time.Since(setupStart)
+	if measureSetup {
+		fmt.Printf("All clients setup completed in %.2f seconds (including connectivity tests)\n", totalSetupTime.Seconds())
+	} else {
+		fmt.Printf("All clients setup completed in %.2f seconds\n", totalSetupTime.Seconds())
+	}
+
+	// Start progress reporting
+	go reportProgress(ctx, stats, verbose)
+
+	// Wait for all workers to complete
+	wg.Wait()
+
+	// Print final results
+	printFinalResults(stats, testTime, measureSetup)
+}
+
+// runDynamicWorkload runs workload with dynamic traffic patterns
+func runDynamicWorkload(cmd *cobra.Command, trafficPatternFile, cacheType string, zipfExp float64,
+	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData, measureSetup, verbose bool,
+	timeoutSeconds int, stats *WorkloadStats) {
+
+	// Parse traffic pattern
+	trafficConfigs, err := parseTrafficPattern(trafficPatternFile)
+	if err != nil {
+		log.Fatalf("Failed to parse traffic pattern: %v", err)
+	}
+
+	// Parse ratio
+	setRatio, getRatio, err := parseRatio(ratioStr)
+	if err != nil {
+		log.Fatalf("Invalid ratio: %v", err)
+	}
+
+	// Create data generator
+	generator := &DataGenerator{
+		DataSize:   dataSize,
+		RandomData: randomData,
+	}
+
+	fmt.Printf("Starting dynamic workload with %d traffic configurations...\n", len(trafficConfigs))
+	for i, config := range trafficConfigs {
+		qpsStr := "unlimited"
+		if config.QPS != -1 {
+			qpsStr = fmt.Sprintf("%d", config.QPS)
+		}
+		fmt.Printf("  %d. Time %ds: %d clients, %s QPS\n", i+1, config.TimeSeconds, config.Clients, qpsStr)
+	}
+	fmt.Println()
+
+	// Calculate total test time
+	totalTestTime := trafficConfigs[len(trafficConfigs)-1].TimeSeconds + 10 // Add 10 seconds buffer
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(totalTestTime)*time.Second)
+	defer cancel()
+
+	// Start traffic pattern manager
+	go manageTrafficPattern(ctx, trafficConfigs, cacheType, cmd, generator, stats,
+		setRatio, getRatio, keyPrefix, keyMin, totalKeys, zipfExp, measureSetup, verbose, timeoutSeconds)
+
+	// Start progress reporting
+	go reportProgress(ctx, stats, verbose)
+
+	// Wait for context to complete
+	<-ctx.Done()
+
+	// Finish current time block
+	stats.FinishCurrentTimeBlock()
+
+	// Print final results with time block breakdown
+	printDynamicFinalResults(stats, trafficConfigs, measureSetup)
+}
+
+// runWorker runs a single worker that performs mixed GET/SET operations
+func runWorker(ctx context.Context, wg *sync.WaitGroup, workerID int, client CacheClient,
+	totalKeys int, zipfExp float64, generator *DataGenerator, stats *WorkloadStats,
+	setRatio, getRatio int, keyPrefix string, keyMin int,
+	limiter *rate.Limiter, timeoutSeconds int, verbose bool) {
+
+	defer wg.Done()
+	defer client.Close()
+
+	// Create a worker-specific Zipf generator with unique seed to ensure different key patterns
+	seed := time.Now().UnixNano() + int64(workerID*1000)
+	if verbose {
+		fmt.Printf("Worker %d: Creating Zipf generator with totalKeys=%d, zipfExp=%f, seed=%d\n",
+			workerID, totalKeys, zipfExp, seed)
+	}
+	zipfGen := NewZipfGenerator(uint64(totalKeys), zipfExp, seed)
+
+	totalRatio := setRatio + getRatio
+	if totalRatio == 0 {
+		return // Nothing to do
+	}
+
+	var opCount int64
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Apply rate limiting if configured
+		if limiter != nil {
+			err := limiter.Wait(ctx)
+			if err != nil {
+				return
+			}
+		}
+
+		// Determine operation type based on ratio
+		opCount++
+		isSet := (opCount % int64(totalRatio)) < int64(setRatio)
+
+		// Generate key using Zipf distribution
+		keyOffset := zipfGen.Next()
+		key := fmt.Sprintf("%s%d", keyPrefix, keyMin+int(keyOffset))
+
+		// Create operation timeout context
+		opCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+
+		if isSet {
+			// Perform SET operation
+			data, err := generator.GenerateData()
+			if err != nil {
+				atomic.AddInt64(&stats.SetErrors, 1)
+				cancel()
+				continue
+			}
+
+			start := time.Now()
+			err = client.Set(opCtx, key, data, 0) // No expiration for workload
+			latency := time.Since(start)
+			cancel()
+
+			if err != nil {
+				atomic.AddInt64(&stats.SetErrors, 1)
+				stats.RecordOperationInBlock(true, 0, true)
+			} else {
+				atomic.AddInt64(&stats.SetOps, 1)
+				stats.SetStats.RecordLatency(latency.Microseconds())
+				stats.RecordOperationInBlock(true, latency.Microseconds(), false)
+			}
+		} else {
+			// Perform GET operation
+			start := time.Now()
+			_, err := client.Get(opCtx, key)
+			latency := time.Since(start)
+			cancel()
+
+			if err != nil {
+				atomic.AddInt64(&stats.GetErrors, 1)
+				stats.RecordOperationInBlock(false, 0, true)
+			} else {
+				atomic.AddInt64(&stats.GetOps, 1)
+				stats.GetStats.RecordLatency(latency.Microseconds())
+				stats.RecordOperationInBlock(false, latency.Microseconds(), false)
+			}
+		}
+	}
+}
+
+// manageTrafficPattern manages dynamic client scaling and QPS changes
+func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheType string,
+	cmd *cobra.Command, generator *DataGenerator, stats *WorkloadStats,
+	setRatio, getRatio int, keyPrefix string, keyMin, totalKeys int, zipfExp float64,
+	measureSetup, verbose bool, timeoutSeconds int) {
+
+	var activeWorkers []context.CancelFunc
+	var wg sync.WaitGroup
+	startTime := time.Now()
+
+	for _, config := range configs {
+		// Wait until it's time for this configuration
+		targetTime := time.Duration(config.TimeSeconds) * time.Second
+		elapsed := time.Since(startTime)
+		if targetTime > elapsed {
+			select {
+			case <-time.After(targetTime - elapsed):
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		// Start new time block tracking
+		stats.StartTimeBlock(config)
+
+		if verbose {
+			qpsStr := "unlimited"
+			if config.QPS != -1 {
+				qpsStr = fmt.Sprintf("%d", config.QPS)
+			}
+			fmt.Printf("Time %ds: Scaling to %d clients, %s QPS\n",
+				config.TimeSeconds, config.Clients, qpsStr)
+		}
+
+		// Stop excess workers if scaling down
+		currentWorkers := len(activeWorkers)
+		if config.Clients < currentWorkers {
+			for i := config.Clients; i < currentWorkers; i++ {
+				activeWorkers[i]() // Cancel the worker
+			}
+			activeWorkers = activeWorkers[:config.Clients]
+		}
+
+		// Start new workers if scaling up
+		for i := currentWorkers; i < config.Clients; i++ {
+			// Create cache client
+			var client CacheClient
+			var err error
+
+			if measureSetup {
+				client, err = createAndTestCacheClient(cacheType, cmd, stats)
+			} else {
+				client, err = createCacheClientForRun(cacheType, cmd)
+			}
+
+			if err != nil {
+				log.Printf("Failed to create client %d: %v", i, err)
+				continue
+			}
+
+			// Create rate limiter
+			var limiter *rate.Limiter
+			if config.QPS > 0 {
+				clientRPS := float64(config.QPS) / float64(config.Clients)
+				limiter = rate.NewLimiter(rate.Limit(clientRPS), 1)
+			}
+
+			// Create worker context
+			workerCtx, workerCancel := context.WithCancel(ctx)
+			activeWorkers = append(activeWorkers, workerCancel)
+
+			wg.Add(1)
+			go runWorker(workerCtx, &wg, i, client, totalKeys, zipfExp, generator, stats,
+				setRatio, getRatio, keyPrefix, keyMin, limiter, timeoutSeconds, verbose)
+		}
+	}
+
+	// Wait for context cancellation
+	<-ctx.Done()
+
+	// Cancel all workers
+	for _, cancel := range activeWorkers {
+		cancel()
+	}
+
+	// Wait for all workers to finish
+	wg.Wait()
+}
+
+// reportProgress reports workload progress periodically
+func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			getOps := atomic.LoadInt64(&stats.GetOps)
+			setOps := atomic.LoadInt64(&stats.SetOps)
+			getErrors := atomic.LoadInt64(&stats.GetErrors)
+			setErrors := atomic.LoadInt64(&stats.SetErrors)
+
+			totalOps := getOps + setOps
+
+			if totalOps > 0 {
+				getQPS := float64(getOps) / time.Since(stats.GetStats.StartTime).Seconds()
+				setQPS := float64(setOps) / time.Since(stats.SetStats.StartTime).Seconds()
+
+				fmt.Printf("Progress: GET %d ops (%.0f QPS, %d errors), SET %d ops (%.0f QPS, %d errors)\n",
+					getOps, getQPS, getErrors, setOps, setQPS, setErrors)
+			}
+		}
+	}
+}
+
+// printFinalResults prints the final workload results
+func printFinalResults(stats *WorkloadStats, testTime int, measureSetup bool) {
+	getOps := atomic.LoadInt64(&stats.GetOps)
+	setOps := atomic.LoadInt64(&stats.SetOps)
+	getErrors := atomic.LoadInt64(&stats.GetErrors)
+	setErrors := atomic.LoadInt64(&stats.SetErrors)
+
+	totalOps := getOps + setOps
+	totalErrors := getErrors + setErrors
+
+	fmt.Println("\n" + strings.Repeat("=", 60))
+	fmt.Println("WORKLOAD RESULTS")
+	fmt.Println(strings.Repeat("=", 60))
+
+	fmt.Printf("Test Duration: %d seconds\n", testTime)
+	fmt.Printf("Total Operations: %d\n", totalOps)
+	fmt.Printf("Total Errors: %d (%.2f%%)\n", totalErrors, float64(totalErrors)/float64(totalOps)*100)
+	fmt.Println()
+
+	// Client setup statistics (only if measurement was enabled)
+	if measureSetup {
+		_, _, _, _, setupP50, setupP95, setupP99 := stats.SetupStats.GetStats()
+		setupCount := stats.SetupStats.Histogram.TotalCount()
+		if setupCount > 0 {
+			fmt.Printf("Client Setup Statistics (%d clients):\n", setupCount)
+			fmt.Printf("Setup Time - P50: %d μs, P95: %d μs, P99: %d μs\n", setupP50, setupP95, setupP99)
+			fmt.Printf("(includes client creation + ping/connectivity test)\n")
+			fmt.Println()
+		}
+	}
+
+	// GET statistics
+	if getOps > 0 {
+		getQPS := float64(getOps) / float64(testTime)
+		_, _, _, _, getP50, getP95, getP99 := stats.GetStats.GetStats()
+
+		fmt.Printf("GET Operations: %d\n", getOps)
+		fmt.Printf("GET QPS: %.2f\n", getQPS)
+		fmt.Printf("GET Errors: %d (%.2f%%)\n", getErrors, float64(getErrors)/float64(getOps)*100)
+		fmt.Printf("GET Latency - P50: %d μs, P95: %d μs, P99: %d μs\n", getP50, getP95, getP99)
+		fmt.Println()
+	}
+
+	// SET statistics
+	if setOps > 0 {
+		setQPS := float64(setOps) / float64(testTime)
+		_, _, _, _, setP50, setP95, setP99 := stats.SetStats.GetStats()
+
+		fmt.Printf("SET Operations: %d\n", setOps)
+		fmt.Printf("SET QPS: %.2f\n", setQPS)
+		fmt.Printf("SET Errors: %d (%.2f%%)\n", setErrors, float64(setErrors)/float64(setOps)*100)
+		fmt.Printf("SET Latency - P50: %d μs, P95: %d μs, P99: %d μs\n", setP50, setP95, setP99)
+	}
+
+	fmt.Println(strings.Repeat("=", 60))
+}
+
+// printDynamicFinalResults prints results with time block breakdown
+func printDynamicFinalResults(stats *WorkloadStats, configs []TrafficConfig, measureSetup bool) {
+	getOps := atomic.LoadInt64(&stats.GetOps)
+	setOps := atomic.LoadInt64(&stats.SetOps)
+	getErrors := atomic.LoadInt64(&stats.GetErrors)
+	setErrors := atomic.LoadInt64(&stats.SetErrors)
+
+	totalOps := getOps + setOps
+	totalErrors := getErrors + setErrors
+
+	fmt.Println("\n" + strings.Repeat("=", 80))
+	fmt.Println("DYNAMIC WORKLOAD RESULTS")
+	fmt.Println(strings.Repeat("=", 80))
+
+	fmt.Printf("Total Operations: %d\n", totalOps)
+	fmt.Printf("Total Errors: %d (%.2f%%)\n", totalErrors, float64(totalErrors)/float64(totalOps)*100)
+	fmt.Println()
+
+	// Overall statistics
+	if getOps > 0 {
+		_, _, _, _, getP50, getP95, getP99 := stats.GetStats.GetStats()
+		fmt.Printf("Overall GET - Ops: %d, Errors: %d, P50: %d μs, P95: %d μs, P99: %d μs\n",
+			getOps, getErrors, getP50, getP95, getP99)
+	}
+
+	if setOps > 0 {
+		_, _, _, _, setP50, setP95, setP99 := stats.SetStats.GetStats()
+		fmt.Printf("Overall SET - Ops: %d, Errors: %d, P50: %d μs, P95: %d μs, P99: %d μs\n",
+			setOps, setErrors, setP50, setP95, setP99)
+	}
+	fmt.Println()
+
+	// Client setup statistics (only if measurement was enabled)
+	if measureSetup {
+		_, _, _, _, setupP50, setupP95, setupP99 := stats.SetupStats.GetStats()
+		setupCount := stats.SetupStats.Histogram.TotalCount()
+		if setupCount > 0 {
+			fmt.Printf("Client Setup Statistics (%d clients):\n", setupCount)
+			fmt.Printf("Setup Time - P50: %d μs, P95: %d μs, P99: %d μs\n", setupP50, setupP95, setupP99)
+			fmt.Printf("(includes client creation + ping/connectivity test)\n")
+			fmt.Println()
+		}
+	}
+
+	// Time block breakdown
+	fmt.Println("TIME BLOCK BREAKDOWN:")
+	fmt.Println(strings.Repeat("-", 80))
+	fmt.Printf("%-8s %-8s %-12s %-12s %-12s %-12s %-12s %-12s\n",
+		"Time", "Clients", "Target QPS", "Actual QPS", "GET Ops", "SET Ops", "GET P95", "SET P95")
+	fmt.Println(strings.Repeat("-", 80))
+
+	for _, block := range stats.TimeBlocks {
+		duration := block.EndTime.Sub(block.StartTime).Seconds()
+		actualGetOps := atomic.LoadInt64(&block.ActualGetOps)
+		actualSetOps := atomic.LoadInt64(&block.ActualSetOps)
+		totalBlockOps := actualGetOps + actualSetOps
+		actualQPS := float64(totalBlockOps) / duration
+
+		targetQPSStr := "unlimited"
+		if block.Config.QPS != -1 {
+			targetQPSStr = fmt.Sprintf("%d", block.Config.QPS)
+		}
+
+		var getP95, setP95 int64
+		if actualGetOps > 0 {
+			_, _, _, _, _, getP95, _ = block.GetStats.GetStats()
+		}
+		if actualSetOps > 0 {
+			_, _, _, _, _, setP95, _ = block.SetStats.GetStats()
+		}
+
+		fmt.Printf("%-8ds %-8d %-12s %-12.0f %-12d %-12d %-12d %-12d\n",
+			block.Config.TimeSeconds, block.Config.Clients, targetQPSStr, actualQPS,
+			actualGetOps, actualSetOps, getP95, setP95)
+	}
+
+	fmt.Println(strings.Repeat("=", 80))
 }
 
 func init() {
 	rootCmd.AddCommand(runCmd)
 
-	// Here you will define your flags and configuration settings.
+	// Cache Type Options
+	runCmd.Flags().StringP("cache-type", "t", "redis", "Cache type: redis or momento")
 
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// runCmd.PersistentFlags().String("foo", "", "A help for foo")
+	// Client Options
+	defaultClients := runtime.NumCPU()
+	runCmd.Flags().IntP("clients", "c", defaultClients, "Number of concurrent clients")
+	runCmd.Flags().IntP("rps", "r", 0, "Rate limit in requests per second (0 = unlimited)")
+	runCmd.Flags().IntP("timeout", "T", 10, "Operation timeout in seconds")
+	runCmd.Flags().BoolP("verbose", "v", false, "Enable verbose output")
 
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// runCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	// Redis Options (reuse from populate)
+	runCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI")
+	runCmd.Flags().Int("redis-dial-timeout", 10, "Redis dial timeout in seconds")
+	runCmd.Flags().Int("redis-read-timeout", 10, "Redis read timeout in seconds")
+	runCmd.Flags().Int("redis-write-timeout", 10, "Redis write timeout in seconds")
+	runCmd.Flags().Int("redis-pool-timeout", 30, "Redis connection pool timeout in seconds")
+	runCmd.Flags().Int("redis-conn-max-idle-time", 30, "Redis connection max idle time in seconds")
+	runCmd.Flags().Int("redis-max-retries", 3, "Redis maximum number of retries")
+	runCmd.Flags().Int("redis-min-retry-backoff", 1000, "Redis minimum retry backoff in milliseconds")
+	runCmd.Flags().Int("redis-max-retry-backoff", 10000, "Redis maximum retry backoff in milliseconds")
+
+	// Momento Options (reuse from populate)
+	runCmd.Flags().String("momento-api-key", "", "Momento API key (or set MOMENTO_API_KEY env var)")
+	runCmd.Flags().String("momento-cache-name", "test-cache", "Momento cache name")
+	runCmd.Flags().Bool("momento-create-cache", true, "Automatically create Momento cache if it doesn't exist")
+
+	// Workload-specific Options
+	runCmd.Flags().Float64("key-zipf-exp", 1.0, "Zipf distribution exponent (0 < exp <= 5), higher = more concentration")
+	runCmd.Flags().Int("test-time", 60, "Number of seconds to run the test")
+	runCmd.Flags().String("ratio", "1:10", "Set:Get ratio (e.g., 1:10 means 1 set for every 10 gets)")
+	runCmd.Flags().Bool("measure-setup", true, "Measure client setup time including ping/connectivity test")
+	runCmd.Flags().String("traffic-pattern", "", "CSV file with traffic pattern (time_seconds,clients,qps). Overrides --clients and --rps")
+
+	// Key Options
+	runCmd.Flags().String("key-prefix", "memtier-", "Prefix for keys")
+	runCmd.Flags().Int("key-minimum", 0, "Key ID minimum value")
+	runCmd.Flags().Int("key-maximum", 10000000, "Key ID maximum value")
+
+	// Data Options
+	runCmd.Flags().IntP("data-size", "d", 32, "Object data size in bytes")
+	runCmd.Flags().BoolP("random-data", "R", false, "Use random data instead of pattern data")
 }

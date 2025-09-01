@@ -18,6 +18,8 @@ import (
 // CacheClient interface defines the operations for cache data sinks
 type CacheClient interface {
 	Set(ctx context.Context, key string, value []byte, expiration time.Duration) error
+	Get(ctx context.Context, key string) ([]byte, error)
+	Ping(ctx context.Context) error
 	Close() error
 	Name() string
 }
