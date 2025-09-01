@@ -87,6 +87,38 @@ type TimeBlockStats struct {
 	SetStats     *PerformanceStats
 }
 
+// CSVLogger handles CSV output of performance metrics
+type CSVLogger struct {
+	file   *os.File
+	writer *csv.Writer
+	mutex  sync.Mutex
+}
+
+// MetricsSnapshot represents a point-in-time snapshot of metrics
+type MetricsSnapshot struct {
+	Timestamp      time.Time
+	ElapsedSeconds int
+	TargetClients  int
+	ActualClients  int
+	TargetQPS      int
+	ActualTotalQPS float64
+	ActualGetQPS   float64
+	ActualSetQPS   float64
+	TotalOps       int64
+	GetOps         int64
+	SetOps         int64
+	GetErrors      int64
+	SetErrors      int64
+	GetLatencyP50  int64
+	GetLatencyP95  int64
+	GetLatencyP99  int64
+	GetLatencyMax  int64
+	SetLatencyP50  int64
+	SetLatencyP95  int64
+	SetLatencyP99  int64
+	SetLatencyMax  int64
+}
+
 // WorkloadStats tracks workload performance metrics
 type WorkloadStats struct {
 	GetOps       int64
@@ -99,6 +131,7 @@ type WorkloadStats struct {
 	TimeBlocks   []TimeBlockStats  // Performance per time block
 	CurrentBlock *TimeBlockStats   // Currently active time block
 	BlockMutex   sync.RWMutex      // Protects time block operations
+	CSVLogger    *CSVLogger        // CSV output logger
 }
 
 func NewWorkloadStats() *WorkloadStats {
@@ -108,6 +141,93 @@ func NewWorkloadStats() *WorkloadStats {
 		SetupStats: NewPerformanceStats(),
 		TimeBlocks: make([]TimeBlockStats, 0),
 	}
+}
+
+// NewCSVLogger creates a new CSV logger with the specified filename
+func NewCSVLogger(filename string) (*CSVLogger, error) {
+	file, err := os.Create(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create CSV file: %w", err)
+	}
+
+	writer := csv.NewWriter(file)
+	logger := &CSVLogger{
+		file:   file,
+		writer: writer,
+	}
+
+	// Write CSV header
+	header := []string{
+		"timestamp", "elapsed_seconds", "target_clients", "actual_clients", "target_qps",
+		"actual_total_qps", "actual_get_qps", "actual_set_qps",
+		"total_ops", "get_ops", "set_ops", "get_errors", "set_errors",
+		"get_latency_p50_us", "get_latency_p95_us", "get_latency_p99_us", "get_latency_max_us",
+		"set_latency_p50_us", "set_latency_p95_us", "set_latency_p99_us", "set_latency_max_us",
+	}
+
+	if err := writer.Write(header); err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to write CSV header: %w", err)
+	}
+	writer.Flush()
+
+	return logger, nil
+}
+
+// LogMetrics writes a metrics snapshot to the CSV file
+func (cl *CSVLogger) LogMetrics(snapshot MetricsSnapshot) error {
+	cl.mutex.Lock()
+	defer cl.mutex.Unlock()
+
+	targetQPSStr := strconv.Itoa(snapshot.TargetQPS)
+	if snapshot.TargetQPS == -1 {
+		targetQPSStr = "unlimited"
+	}
+
+	record := []string{
+		snapshot.Timestamp.Format(time.RFC3339),
+		strconv.Itoa(snapshot.ElapsedSeconds),
+		strconv.Itoa(snapshot.TargetClients),
+		strconv.Itoa(snapshot.ActualClients),
+		targetQPSStr,
+		fmt.Sprintf("%.2f", snapshot.ActualTotalQPS),
+		fmt.Sprintf("%.2f", snapshot.ActualGetQPS),
+		fmt.Sprintf("%.2f", snapshot.ActualSetQPS),
+		strconv.FormatInt(snapshot.TotalOps, 10),
+		strconv.FormatInt(snapshot.GetOps, 10),
+		strconv.FormatInt(snapshot.SetOps, 10),
+		strconv.FormatInt(snapshot.GetErrors, 10),
+		strconv.FormatInt(snapshot.SetErrors, 10),
+		strconv.FormatInt(snapshot.GetLatencyP50, 10),
+		strconv.FormatInt(snapshot.GetLatencyP95, 10),
+		strconv.FormatInt(snapshot.GetLatencyP99, 10),
+		strconv.FormatInt(snapshot.GetLatencyMax, 10),
+		strconv.FormatInt(snapshot.SetLatencyP50, 10),
+		strconv.FormatInt(snapshot.SetLatencyP95, 10),
+		strconv.FormatInt(snapshot.SetLatencyP99, 10),
+		strconv.FormatInt(snapshot.SetLatencyMax, 10),
+	}
+
+	if err := cl.writer.Write(record); err != nil {
+		return fmt.Errorf("failed to write CSV record: %w", err)
+	}
+	cl.writer.Flush()
+
+	return nil
+}
+
+// Close closes the CSV logger
+func (cl *CSVLogger) Close() error {
+	cl.mutex.Lock()
+	defer cl.mutex.Unlock()
+
+	if cl.writer != nil {
+		cl.writer.Flush()
+	}
+	if cl.file != nil {
+		return cl.file.Close()
+	}
+	return nil
 }
 
 // StartTimeBlock starts tracking a new time block
@@ -395,6 +515,7 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	ratioStr, _ := cmd.Flags().GetString("ratio")
 	measureSetup, _ := cmd.Flags().GetBool("measure-setup")
 	trafficPatternFile, _ := cmd.Flags().GetString("traffic-pattern")
+	csvOutput, _ := cmd.Flags().GetString("csv-output")
 
 	// Key parameters
 	keyPrefix, _ := cmd.Flags().GetString("key-prefix")
@@ -429,6 +550,26 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	defer stats.GetStats.Close()
 	defer stats.SetStats.Close()
 	defer stats.SetupStats.Close()
+
+	// Initialize CSV logging
+	if csvOutput == "" {
+		// Generate default filename with timestamp
+		timestamp := time.Now().Format("20060102-150405")
+		if trafficPatternFile != "" {
+			csvOutput = fmt.Sprintf("workload-dynamic-%s.csv", timestamp)
+		} else {
+			csvOutput = fmt.Sprintf("workload-static-%s.csv", timestamp)
+		}
+	}
+
+	csvLogger, err := NewCSVLogger(csvOutput)
+	if err != nil {
+		log.Fatalf("Failed to create CSV logger: %v", err)
+	}
+	stats.CSVLogger = csvLogger
+	defer csvLogger.Close()
+
+	fmt.Printf("Logging metrics to: %s\n", csvOutput)
 
 	fmt.Printf("Starting %s workload run...\n", cacheType)
 	fmt.Printf("Clients: %d\n", clientCount)
@@ -521,12 +662,13 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 	}
 
 	// Start progress reporting
-	go reportProgress(ctx, stats, verbose)
+	go reportStaticProgress(ctx, stats, testTime, clientCount, verbose)
 
 	// Wait for all workers to complete
 	wg.Wait()
 
-	// Print final results
+	// Clear progress line and print final results
+	fmt.Print("\r" + strings.Repeat(" ", 120) + "\r")
 	printFinalResults(stats, testTime, measureSetup)
 }
 
@@ -765,14 +907,18 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 	wg.Wait()
 }
 
-// reportProgress reports workload progress periodically
+// reportProgress reports workload progress with a progress bar
 func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+
+	startTime := time.Now()
 
 	for {
 		select {
 		case <-ctx.Done():
+			// Clear the progress line and print final newline
+			fmt.Print("\r" + strings.Repeat(" ", 120) + "\r")
 			return
 		case <-ticker.C:
 			getOps := atomic.LoadInt64(&stats.GetOps)
@@ -781,16 +927,239 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 			setErrors := atomic.LoadInt64(&stats.SetErrors)
 
 			totalOps := getOps + setOps
+			elapsed := time.Since(startTime)
 
 			if totalOps > 0 {
-				getQPS := float64(getOps) / time.Since(stats.GetStats.StartTime).Seconds()
-				setQPS := float64(setOps) / time.Since(stats.SetStats.StartTime).Seconds()
+				getQPS := float64(getOps) / elapsed.Seconds()
+				setQPS := float64(setOps) / elapsed.Seconds()
+				totalQPS := getQPS + setQPS
 
-				fmt.Printf("Progress: GET %d ops (%.0f QPS, %d errors), SET %d ops (%.0f QPS, %d errors)\n",
-					getOps, getQPS, getErrors, setOps, setQPS, setErrors)
+				// Create progress bar
+				progressBar := createProgressBar(elapsed, stats)
+
+				// Get current client count and target info
+				currentClients := getCurrentClientCount(stats)
+				targetClients, targetQPS := getCurrentTargetInfo(stats)
+
+				// Collect latency metrics
+				_, _, _, _, getP50, getP95, getP99 := stats.GetStats.GetStats()
+				_, _, _, _, setP50, setP95, setP99 := stats.SetStats.GetStats()
+
+				// Create metrics snapshot and log to CSV
+				if stats.CSVLogger != nil {
+					snapshot := MetricsSnapshot{
+						Timestamp:      time.Now(),
+						ElapsedSeconds: int(elapsed.Seconds()),
+						TargetClients:  targetClients,
+						ActualClients:  currentClients,
+						TargetQPS:      targetQPS,
+						ActualTotalQPS: totalQPS,
+						ActualGetQPS:   getQPS,
+						ActualSetQPS:   setQPS,
+						TotalOps:       totalOps,
+						GetOps:         getOps,
+						SetOps:         setOps,
+						GetErrors:      getErrors,
+						SetErrors:      setErrors,
+						GetLatencyP50:  getP50,
+						GetLatencyP95:  getP95,
+						GetLatencyP99:  getP99,
+						GetLatencyMax:  stats.GetStats.Histogram.Max(),
+						SetLatencyP50:  setP50,
+						SetLatencyP95:  setP95,
+						SetLatencyP99:  setP99,
+						SetLatencyMax:  stats.SetStats.Histogram.Max(),
+					}
+					stats.CSVLogger.LogMetrics(snapshot)
+				}
+
+				// Format the progress line (clear line first, then write)
+				progressLine := fmt.Sprintf("\r%s | %d clients | %.0f ops/s | GET: %.0f/s | SET: %.0f/s",
+					progressBar, currentClients, totalQPS, getQPS, setQPS)
+
+				// Truncate if too long for terminal
+				if len(progressLine) > 120 {
+					progressLine = progressLine[:117] + "..."
+				}
+
+				fmt.Print(progressLine)
 			}
 		}
 	}
+}
+
+// createProgressBar creates a visual progress bar based on current time block
+func createProgressBar(elapsed time.Duration, stats *WorkloadStats) string {
+	stats.BlockMutex.RLock()
+	defer stats.BlockMutex.RUnlock()
+
+	if stats.CurrentBlock == nil {
+		return "[----] 00:00"
+	}
+
+	blockElapsed := elapsed
+	if !stats.CurrentBlock.StartTime.IsZero() {
+		blockElapsed = time.Since(stats.CurrentBlock.StartTime)
+	}
+
+	// Create a simple progress indicator
+	barWidth := 20
+	progress := int(blockElapsed.Seconds()) % (barWidth * 2)
+	if progress > barWidth {
+		progress = (barWidth * 2) - progress
+	}
+
+	bar := "["
+	for i := 0; i < barWidth; i++ {
+		if i < progress {
+			bar += "="
+		} else if i == progress {
+			bar += ">"
+		} else {
+			bar += "-"
+		}
+	}
+	bar += "]"
+
+	// Add elapsed time
+	minutes := int(elapsed.Minutes())
+	seconds := int(elapsed.Seconds()) % 60
+	timeStr := fmt.Sprintf("%02d:%02d", minutes, seconds)
+
+	return fmt.Sprintf("%s %s", bar, timeStr)
+}
+
+// getCurrentClientCount returns the current number of active clients
+func getCurrentClientCount(stats *WorkloadStats) int {
+	stats.BlockMutex.RLock()
+	defer stats.BlockMutex.RUnlock()
+
+	if stats.CurrentBlock != nil {
+		return stats.CurrentBlock.Config.Clients
+	}
+	return 0
+}
+
+// getCurrentTargetInfo returns current target clients and QPS
+func getCurrentTargetInfo(stats *WorkloadStats) (int, int) {
+	stats.BlockMutex.RLock()
+	defer stats.BlockMutex.RUnlock()
+
+	if stats.CurrentBlock != nil {
+		return stats.CurrentBlock.Config.Clients, stats.CurrentBlock.Config.QPS
+	}
+	return 0, 0
+}
+
+// reportStaticProgress reports progress for static workload with progress bar
+func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime int, clientCount int, verbose bool) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	startTime := time.Now()
+	totalDuration := time.Duration(testTime) * time.Second
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Clear the progress line
+			fmt.Print("\r" + strings.Repeat(" ", 120) + "\r")
+			return
+		case <-ticker.C:
+			getOps := atomic.LoadInt64(&stats.GetOps)
+			setOps := atomic.LoadInt64(&stats.SetOps)
+			getErrors := atomic.LoadInt64(&stats.GetErrors)
+			setErrors := atomic.LoadInt64(&stats.SetErrors)
+
+			totalOps := getOps + setOps
+			elapsed := time.Since(startTime)
+
+			if totalOps > 0 {
+				getQPS := float64(getOps) / elapsed.Seconds()
+				setQPS := float64(setOps) / elapsed.Seconds()
+				totalQPS := getQPS + setQPS
+
+				// Collect latency metrics
+				_, _, _, _, getP50, getP95, getP99 := stats.GetStats.GetStats()
+				_, _, _, _, setP50, setP95, setP99 := stats.SetStats.GetStats()
+
+				// Create metrics snapshot and log to CSV
+				if stats.CSVLogger != nil {
+					snapshot := MetricsSnapshot{
+						Timestamp:      time.Now(),
+						ElapsedSeconds: int(elapsed.Seconds()),
+						TargetClients:  clientCount,
+						ActualClients:  clientCount,
+						TargetQPS:      -1, // Static workload doesn't have target QPS
+						ActualTotalQPS: totalQPS,
+						ActualGetQPS:   getQPS,
+						ActualSetQPS:   setQPS,
+						TotalOps:       totalOps,
+						GetOps:         getOps,
+						SetOps:         setOps,
+						GetErrors:      getErrors,
+						SetErrors:      setErrors,
+						GetLatencyP50:  getP50,
+						GetLatencyP95:  getP95,
+						GetLatencyP99:  getP99,
+						GetLatencyMax:  stats.GetStats.Histogram.Max(),
+						SetLatencyP50:  setP50,
+						SetLatencyP95:  setP95,
+						SetLatencyP99:  setP99,
+						SetLatencyMax:  stats.SetStats.Histogram.Max(),
+					}
+					stats.CSVLogger.LogMetrics(snapshot)
+				}
+
+				// Create progress bar for static workload
+				progressBar := createStaticProgressBar(elapsed, totalDuration)
+
+				// Format the progress line
+				progressLine := fmt.Sprintf("\r%s | %d clients | %.0f ops/s | GET: %.0f/s | SET: %.0f/s",
+					progressBar, clientCount, totalQPS, getQPS, setQPS)
+
+				// Truncate if too long for terminal
+				if len(progressLine) > 120 {
+					progressLine = progressLine[:117] + "..."
+				}
+
+				fmt.Print(progressLine)
+			}
+		}
+	}
+}
+
+// createStaticProgressBar creates a progress bar for static workload
+func createStaticProgressBar(elapsed, total time.Duration) string {
+	barWidth := 20
+	progress := float64(elapsed) / float64(total)
+	if progress > 1.0 {
+		progress = 1.0
+	}
+
+	filled := int(progress * float64(barWidth))
+
+	bar := "["
+	for i := 0; i < barWidth; i++ {
+		if i < filled {
+			bar += "="
+		} else if i == filled && progress < 1.0 {
+			bar += ">"
+		} else {
+			bar += "-"
+		}
+	}
+	bar += "]"
+
+	// Add elapsed/total time
+	elapsedMin := int(elapsed.Minutes())
+	elapsedSec := int(elapsed.Seconds()) % 60
+	totalMin := int(total.Minutes())
+	totalSec := int(total.Seconds()) % 60
+
+	timeStr := fmt.Sprintf("%02d:%02d/%02d:%02d", elapsedMin, elapsedSec, totalMin, totalSec)
+
+	return fmt.Sprintf("%s %s", bar, timeStr)
 }
 
 // printFinalResults prints the final workload results
@@ -964,6 +1333,7 @@ func init() {
 	runCmd.Flags().String("ratio", "1:10", "Set:Get ratio (e.g., 1:10 means 1 set for every 10 gets)")
 	runCmd.Flags().Bool("measure-setup", true, "Measure client setup time including ping/connectivity test")
 	runCmd.Flags().String("traffic-pattern", "", "CSV file with traffic pattern (time_seconds,clients,qps). Overrides --clients and --rps")
+	runCmd.Flags().String("csv-output", "", "CSV file to log performance metrics (default: auto-generated filename)")
 
 	// Key Options
 	runCmd.Flags().String("key-prefix", "memtier-", "Prefix for keys")
