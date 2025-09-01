@@ -13,6 +13,30 @@ import (
 	"time"
 )
 
+// Pre-computed pattern for efficient data generation
+var basePattern = []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+// fillPatternData efficiently fills a buffer with repeating pattern
+func fillPatternData(data []byte) {
+	patternLen := len(basePattern)
+
+	// For small buffers, just copy byte by byte
+	if len(data) <= patternLen {
+		for i := range data {
+			data[i] = basePattern[i%patternLen]
+		}
+		return
+	}
+
+	// For larger buffers, copy pattern once then use copy() to double efficiently
+	copy(data[:patternLen], basePattern)
+
+	// Double the pattern until we fill most of the buffer
+	for copied := patternLen; copied < len(data); copied *= 2 {
+		copy(data[copied:], data[:copied])
+	}
+}
+
 // DataGenerator handles data generation for populate operations
 type DataGenerator struct {
 	DataSize        int
@@ -45,17 +69,16 @@ func (dg *DataGenerator) GenerateData() ([]byte, error) {
 	}
 
 	data := make([]byte, size)
+
 	if dg.RandomData {
+		// For random data, fill with crypto random bytes
 		_, err := cryptorand.Read(data)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate random data: %w", err)
 		}
 	} else {
-		// Fill with pattern data
-		pattern := []byte("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
-		for i := range data {
-			data[i] = pattern[i%len(pattern)]
-		}
+		// For pattern data, use efficient pattern filling
+		fillPatternData(data)
 	}
 
 	return data, nil

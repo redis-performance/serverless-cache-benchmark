@@ -17,14 +17,8 @@ func NewRedisClientFromURI(uri string) (*RedisClient, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// Optimize connection pool for high-throughput scenarios
-	opts.PoolSize = 10    // Max connections per client
-	opts.MinIdleConns = 2 // Keep some connections warm
-	opts.MaxIdleConns = 5 // Don't keep too many idle
-	opts.ConnMaxIdleTime = 30 * time.Second
+	opts.ConnMaxIdleTime = 5 * time.Second
 	opts.PoolTimeout = 5 * time.Second
-
 	rdb := redis.NewClient(opts)
 	return &RedisClient{client: rdb}, nil
 }
