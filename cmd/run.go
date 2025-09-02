@@ -1688,6 +1688,11 @@ func runConnectionSetupBenchmark(cmd *cobra.Command, args []string) {
 	fmt.Printf("Creating %d connections as fast as possible...\n", clientCount)
 	startTime := time.Now()
 
+	// Start progress reporting
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go reportConnectionSetupProgress(ctx, &successCount, &failureCount, clientCount, startTime, setupStats)
+
 	// Create connections concurrently
 	for i := 0; i < clientCount; i++ {
 		wg.Add(1)
@@ -1730,19 +1735,27 @@ func runConnectionSetupBenchmark(cmd *cobra.Command, args []string) {
 
 	// Wait for all connections to complete
 	wg.Wait()
+	cancel() // Stop progress reporting
 	totalTime := time.Since(startTime)
 
-	// Get final statistics
-	_, success, failed, _, p50, p95, p99 := setupStats.GetStats()
+	// Clear progress line
+	fmt.Print("\r" + strings.Repeat(" ", 120) + "\r")
+
+	// Get final statistics from atomic counters
+	finalSuccessCount := atomic.LoadInt64(&successCount)
+	finalFailureCount := atomic.LoadInt64(&failureCount)
+
+	// Get latency statistics from performance stats
+	_, _, _, _, p50, p95, p99 := setupStats.GetStats()
 	maxSetupTime := setupStats.Histogram.Max()
 
 	fmt.Printf("\n=== Connection Setup Results ===\n")
 	fmt.Printf("Total Time: %v\n", totalTime)
 	fmt.Printf("Total Connections Attempted: %d\n", clientCount)
-	fmt.Printf("Successful Connections: %d\n", success)
-	fmt.Printf("Failed Connections: %d\n", failed)
-	fmt.Printf("Success Rate: %.2f%%\n", float64(success)/float64(clientCount)*100)
-	fmt.Printf("Connections per Second: %.2f\n", float64(success)/totalTime.Seconds())
+	fmt.Printf("Successful Connections: %d\n", finalSuccessCount)
+	fmt.Printf("Failed Connections: %d\n", finalFailureCount)
+	fmt.Printf("Success Rate: %.2f%%\n", float64(finalSuccessCount)/float64(clientCount)*100)
+	fmt.Printf("Connections per Second: %.2f\n", float64(finalSuccessCount)/totalTime.Seconds())
 	fmt.Println()
 	fmt.Printf("Connection Setup Latency Statistics:\n")
 	fmt.Printf("  P50: %d μs (%.2f ms)\n", p50, float64(p50)/1000)
@@ -1751,9 +1764,88 @@ func runConnectionSetupBenchmark(cmd *cobra.Command, args []string) {
 	fmt.Printf("  Max: %d μs (%.2f ms)\n", maxSetupTime, float64(maxSetupTime)/1000)
 	fmt.Println()
 
-	if failed > 0 {
-		fmt.Printf("Note: %d connections failed. Check network connectivity and server capacity.\n", failed)
+	if finalFailureCount > 0 {
+		fmt.Printf("Note: %d connections failed. Check network connectivity and server capacity.\n", finalFailureCount)
 	}
+}
+
+// reportConnectionSetupProgress reports real-time progress for connection setup benchmark
+func reportConnectionSetupProgress(ctx context.Context, successCount, failureCount *int64, totalConnections int, startTime time.Time, setupStats *PerformanceStats) {
+	ticker := time.NewTicker(500 * time.Millisecond) // Update every 500ms for responsive feedback
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// Clear the progress line
+			fmt.Print("\r" + strings.Repeat(" ", 120) + "\r")
+			return
+		case <-ticker.C:
+			currentSuccess := atomic.LoadInt64(successCount)
+			currentFailure := atomic.LoadInt64(failureCount)
+			totalCompleted := currentSuccess + currentFailure
+
+			elapsed := time.Since(startTime)
+
+			if totalCompleted > 0 {
+				// Calculate progress percentage
+				progress := float64(totalCompleted) / float64(totalConnections)
+				if progress > 1.0 {
+					progress = 1.0
+				}
+
+				// Create progress bar
+				progressBar := createConnectionProgressBar(progress, elapsed)
+
+				// Calculate connection rate
+				connRate := float64(totalCompleted) / elapsed.Seconds()
+
+				// Get median connection time from stats
+				var medianTime int64
+				if currentSuccess > 0 {
+					_, _, _, _, medianTime, _, _ = setupStats.GetStats()
+				}
+
+				// Format the progress line
+				progressLine := fmt.Sprintf("\r%s | Completed: %d/%d | Success: %d | Failed: %d | Rate: %.0f conn/s | Median: %.0f ms",
+					progressBar, totalCompleted, totalConnections, currentSuccess, currentFailure,
+					connRate, float64(medianTime)/1000)
+
+				// Truncate if too long for terminal
+				if len(progressLine) > 120 {
+					progressLine = progressLine[:117] + "..."
+				}
+
+				fmt.Print(progressLine)
+			}
+		}
+	}
+}
+
+// createConnectionProgressBar creates a progress bar for connection setup
+func createConnectionProgressBar(progress float64, elapsed time.Duration) string {
+	barWidth := 20
+	filled := int(progress * float64(barWidth))
+
+	bar := "["
+	for i := 0; i < barWidth; i++ {
+		if i < filled {
+			bar += "="
+		} else if i == filled && progress < 1.0 {
+			bar += ">"
+		} else {
+			bar += "-"
+		}
+	}
+	bar += "]"
+
+	// Add elapsed time and percentage
+	seconds := int(elapsed.Seconds())
+	minutes := seconds / 60
+	secs := seconds % 60
+	timeStr := fmt.Sprintf("%02d:%02d", minutes, secs)
+
+	return fmt.Sprintf("%s %s (%.1f%%)", bar, timeStr, progress*100)
 }
 
 func init() {
