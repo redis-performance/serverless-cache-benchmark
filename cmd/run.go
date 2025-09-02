@@ -713,8 +713,10 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	cpuProfile, _ := cmd.Flags().GetString("cpu-profile")
 	memProfile, _ := cmd.Flags().GetString("mem-profile")
 	blockProfile, _ := cmd.Flags().GetString("block-profile")
+	mutexProfile, _ := cmd.Flags().GetString("mutex-profile")
 	pprofAddr, _ := cmd.Flags().GetString("pprof-addr")
 	blockProfileRate, _ := cmd.Flags().GetInt("block-profile-rate")
+	mutexProfileFraction, _ := cmd.Flags().GetInt("mutex-profile-fraction")
 
 	// Enable block profiling if requested
 	if blockProfile != "" || blockProfileRate > 0 {
@@ -734,6 +736,29 @@ func runWorkload(cmd *cobra.Command, args []string) {
 					log.Printf("Could not write block profile: %v", err)
 				} else {
 					fmt.Printf("Block profile written to: %s\n", blockProfile)
+				}
+			}()
+		}
+	}
+
+	// Enable mutex profiling if requested
+	if mutexProfile != "" || mutexProfileFraction > 0 {
+		runtime.SetMutexProfileFraction(mutexProfileFraction)
+		fmt.Printf("Mutex profiling enabled with fraction: %d\n", mutexProfileFraction)
+
+		if mutexProfile != "" {
+			defer func() {
+				f, err := os.Create(mutexProfile)
+				if err != nil {
+					log.Printf("Could not create mutex profile: %v", err)
+					return
+				}
+				defer f.Close()
+
+				if err := pprof.Lookup("mutex").WriteTo(f, 0); err != nil {
+					log.Printf("Could not write mutex profile: %v", err)
+				} else {
+					fmt.Printf("Mutex profile written to: %s\n", mutexProfile)
 				}
 			}()
 		}
@@ -1703,6 +1728,13 @@ func runConnectionSetupBenchmark(cmd *cobra.Command, args []string) {
 		fmt.Printf("Block profiling enabled for connection setup benchmark (rate: %d)\n", blockProfileRate)
 	}
 
+	// Enable mutex profiling for connection setup benchmark if not already set
+	mutexProfileFraction, _ := cmd.Flags().GetInt("mutex-profile-fraction")
+	if mutexProfileFraction > 0 {
+		runtime.SetMutexProfileFraction(mutexProfileFraction)
+		fmt.Printf("Mutex profiling enabled for connection setup benchmark (fraction: %d)\n", mutexProfileFraction)
+	}
+
 	fmt.Printf("=== Connection Setup Benchmark ===\n")
 	fmt.Printf("Cache Type: %s\n", cacheType)
 	fmt.Printf("Target Connections: %d\n", clientCount)
@@ -1898,8 +1930,10 @@ func init() {
 	runCmd.Flags().String("cpu-profile", "", "Write CPU profile to file")
 	runCmd.Flags().String("mem-profile", "", "Write memory profile to file")
 	runCmd.Flags().String("block-profile", "", "Write block profile to file")
+	runCmd.Flags().String("mutex-profile", "", "Write mutex profile to file")
 	runCmd.Flags().String("pprof-addr", "", "Enable pprof HTTP server on address (e.g., localhost:6060)")
 	runCmd.Flags().Int("block-profile-rate", 1, "Block profile rate (0 = disabled, 1 = every blocking event)")
+	runCmd.Flags().Int("mutex-profile-fraction", 1, "Mutex profile fraction (0 = disabled, 1 = every mutex contention)")
 
 	// Redis Options (reuse from populate)
 	runCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI")
