@@ -712,7 +712,32 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	// Start profiling if requested
 	cpuProfile, _ := cmd.Flags().GetString("cpu-profile")
 	memProfile, _ := cmd.Flags().GetString("mem-profile")
+	blockProfile, _ := cmd.Flags().GetString("block-profile")
 	pprofAddr, _ := cmd.Flags().GetString("pprof-addr")
+	blockProfileRate, _ := cmd.Flags().GetInt("block-profile-rate")
+
+	// Enable block profiling if requested
+	if blockProfile != "" || blockProfileRate > 0 {
+		runtime.SetBlockProfileRate(blockProfileRate)
+		fmt.Printf("Block profiling enabled with rate: %d\n", blockProfileRate)
+
+		if blockProfile != "" {
+			defer func() {
+				f, err := os.Create(blockProfile)
+				if err != nil {
+					log.Printf("Could not create block profile: %v", err)
+					return
+				}
+				defer f.Close()
+
+				if err := pprof.Lookup("block").WriteTo(f, 0); err != nil {
+					log.Printf("Could not write block profile: %v", err)
+				} else {
+					fmt.Printf("Block profile written to: %s\n", blockProfile)
+				}
+			}()
+		}
+	}
 
 	// Start pprof HTTP server if requested
 	if pprofAddr != "" {
@@ -1671,6 +1696,13 @@ func runConnectionSetupBenchmark(cmd *cobra.Command, args []string) {
 	timeoutSeconds, _ := cmd.Flags().GetInt("timeout")
 	verbose, _ := cmd.Flags().GetBool("verbose")
 
+	// Enable block profiling for connection setup benchmark if not already set
+	blockProfileRate, _ := cmd.Flags().GetInt("block-profile-rate")
+	if blockProfileRate > 0 {
+		runtime.SetBlockProfileRate(blockProfileRate)
+		fmt.Printf("Block profiling enabled for connection setup benchmark (rate: %d)\n", blockProfileRate)
+	}
+
 	fmt.Printf("=== Connection Setup Benchmark ===\n")
 	fmt.Printf("Cache Type: %s\n", cacheType)
 	fmt.Printf("Target Connections: %d\n", clientCount)
@@ -1865,7 +1897,9 @@ func init() {
 	// Profiling Options
 	runCmd.Flags().String("cpu-profile", "", "Write CPU profile to file")
 	runCmd.Flags().String("mem-profile", "", "Write memory profile to file")
+	runCmd.Flags().String("block-profile", "", "Write block profile to file")
 	runCmd.Flags().String("pprof-addr", "", "Enable pprof HTTP server on address (e.g., localhost:6060)")
+	runCmd.Flags().Int("block-profile-rate", 1, "Block profile rate (0 = disabled, 1 = every blocking event)")
 
 	// Redis Options (reuse from populate)
 	runCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI")

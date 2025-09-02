@@ -242,7 +242,32 @@ func runPopulate(cmd *cobra.Command, args []string) {
 	// Start profiling if requested
 	cpuProfile, _ := cmd.Flags().GetString("cpu-profile")
 	memProfile, _ := cmd.Flags().GetString("mem-profile")
+	blockProfile, _ := cmd.Flags().GetString("block-profile")
 	pprofAddr, _ := cmd.Flags().GetString("pprof-addr")
+	blockProfileRate, _ := cmd.Flags().GetInt("block-profile-rate")
+
+	// Enable block profiling if requested
+	if blockProfile != "" || blockProfileRate > 0 {
+		runtime.SetBlockProfileRate(blockProfileRate)
+		fmt.Printf("Block profiling enabled with rate: %d\n", blockProfileRate)
+
+		if blockProfile != "" {
+			defer func() {
+				f, err := os.Create(blockProfile)
+				if err != nil {
+					log.Printf("Could not create block profile: %v", err)
+					return
+				}
+				defer f.Close()
+
+				if err := pprof.Lookup("block").WriteTo(f, 0); err != nil {
+					log.Printf("Could not write block profile: %v", err)
+				} else {
+					fmt.Printf("Block profile written to: %s\n", blockProfile)
+				}
+			}()
+		}
+	}
 
 	// Start pprof HTTP server if requested
 	if pprofAddr != "" {
@@ -476,7 +501,9 @@ func init() {
 	// Profiling Options
 	populateCmd.Flags().String("cpu-profile", "", "Write CPU profile to file")
 	populateCmd.Flags().String("mem-profile", "", "Write memory profile to file")
+	populateCmd.Flags().String("block-profile", "", "Write block profile to file")
 	populateCmd.Flags().String("pprof-addr", "", "Enable pprof HTTP server on address (e.g., localhost:6060)")
+	populateCmd.Flags().Int("block-profile-rate", 1, "Block profile rate (0 = disabled, 1 = every blocking event)")
 
 	// Redis Options
 	populateCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI (redis://[username[:password]@]host[:port][/db-number] or rediss:// for TLS)")
