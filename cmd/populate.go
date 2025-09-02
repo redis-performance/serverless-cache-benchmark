@@ -555,14 +555,14 @@ func init() {
 	// Redis Options
 	populateCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI (redis://[username[:password]@]host[:port][/db-number] or rediss:// for TLS)")
 	populateCmd.Flags().Bool("cluster-mode", false, "Run client in cluster mode")
-	populateCmd.Flags().Int("redis-dial-timeout", 30, "Redis dial timeout in seconds")
-	populateCmd.Flags().Int("redis-read-timeout", 30, "Redis read timeout in seconds")
-	populateCmd.Flags().Int("redis-write-timeout", 30, "Redis write timeout in seconds")
-	populateCmd.Flags().Int("redis-pool-timeout", 30, "Redis connection pool timeout in seconds")
-	populateCmd.Flags().Int("redis-conn-max-idle-time", 30, "Redis connection max idle time in seconds")
+	populateCmd.Flags().Int("redis-dial-timeout", 120, "Redis dial timeout in seconds")
+	populateCmd.Flags().Int("redis-read-timeout", 120, "Redis read timeout in seconds")
+	populateCmd.Flags().Int("redis-write-timeout", 120, "Redis write timeout in seconds")
+	populateCmd.Flags().Int("redis-pool-timeout", 120, "Redis connection pool timeout in seconds")
+	populateCmd.Flags().Int("redis-conn-max-idle-time", 120, "Redis connection max idle time in seconds")
 	populateCmd.Flags().Int("redis-max-retries", 3, "Redis maximum number of retries")
 	populateCmd.Flags().Int("redis-min-retry-backoff", 1000, "Redis minimum retry backoff in milliseconds")
-	populateCmd.Flags().Int("redis-max-retry-backoff", 10000, "Redis maximum retry backoff in milliseconds")
+	populateCmd.Flags().Int("redis-max-retry-backoff", 120000, "Redis maximum retry backoff in milliseconds")
 
 	// Momento Options
 	populateCmd.Flags().String("momento-api-key", "", "Momento API key (or set MOMENTO_API_KEY env var)")
