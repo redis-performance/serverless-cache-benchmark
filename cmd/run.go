@@ -10,9 +10,12 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"sync"
@@ -706,6 +709,60 @@ func createCacheClientForRun(cacheType string, cmd *cobra.Command) (CacheClient,
 }
 
 func runWorkload(cmd *cobra.Command, args []string) {
+	// Start profiling if requested
+	cpuProfile, _ := cmd.Flags().GetString("cpu-profile")
+	memProfile, _ := cmd.Flags().GetString("mem-profile")
+	pprofAddr, _ := cmd.Flags().GetString("pprof-addr")
+
+	// Start pprof HTTP server if requested
+	if pprofAddr != "" {
+		go func() {
+			fmt.Printf("Starting pprof HTTP server on http://%s/debug/pprof/\n", pprofAddr)
+			if err := http.ListenAndServe(pprofAddr, nil); err != nil {
+				log.Printf("pprof HTTP server failed: %v", err)
+			}
+		}()
+	}
+
+	if cpuProfile != "" {
+		f, err := os.Create(cpuProfile)
+		if err != nil {
+			log.Fatalf("Could not create CPU profile: %v", err)
+		}
+		defer f.Close()
+
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatalf("Could not start CPU profile: %v", err)
+		}
+		defer pprof.StopCPUProfile()
+		fmt.Printf("CPU profiling enabled, writing to: %s\n", cpuProfile)
+	}
+
+	if memProfile != "" {
+		defer func() {
+			f, err := os.Create(memProfile)
+			if err != nil {
+				log.Printf("Could not create memory profile: %v", err)
+				return
+			}
+			defer f.Close()
+
+			runtime.GC() // Get up-to-date statistics
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				log.Printf("Could not write memory profile: %v", err)
+			} else {
+				fmt.Printf("Memory profile written to: %s\n", memProfile)
+			}
+		}()
+	}
+
+	// Check if this is a connection setup benchmark
+	connSetupOnly, _ := cmd.Flags().GetBool("conn-setup-only")
+	if connSetupOnly {
+		runConnectionSetupBenchmark(cmd, args)
+		return
+	}
+
 	// Get command parameters
 	cacheType, _ := cmd.Flags().GetString("cache-type")
 	clientCount, _ := cmd.Flags().GetInt("clients")
@@ -1606,6 +1663,99 @@ func printDynamicFinalResults(stats *WorkloadStats, configs []TrafficConfig, mea
 	fmt.Println(strings.Repeat("=", 80))
 }
 
+// runConnectionSetupBenchmark benchmarks connection setup time
+func runConnectionSetupBenchmark(cmd *cobra.Command, args []string) {
+	// Get command parameters
+	cacheType, _ := cmd.Flags().GetString("cache-type")
+	clientCount, _ := cmd.Flags().GetInt("clients")
+	timeoutSeconds, _ := cmd.Flags().GetInt("timeout")
+	verbose, _ := cmd.Flags().GetBool("verbose")
+
+	fmt.Printf("=== Connection Setup Benchmark ===\n")
+	fmt.Printf("Cache Type: %s\n", cacheType)
+	fmt.Printf("Target Connections: %d\n", clientCount)
+	fmt.Printf("Connection Timeout: %d seconds\n", timeoutSeconds)
+	fmt.Println()
+
+	// Create performance stats for connection setup times
+	setupStats := NewPerformanceStats()
+	defer setupStats.Close()
+
+	// Track successful and failed connections
+	var successCount, failureCount int64
+	var wg sync.WaitGroup
+
+	fmt.Printf("Creating %d connections as fast as possible...\n", clientCount)
+	startTime := time.Now()
+
+	// Create connections concurrently
+	for i := 0; i < clientCount; i++ {
+		wg.Add(1)
+		go func(connID int) {
+			defer wg.Done()
+
+			// Measure connection setup time (create + ping)
+			connStart := time.Now()
+			client, err := createCacheClientForRun(cacheType, cmd)
+			if err != nil {
+				atomic.AddInt64(&failureCount, 1)
+				if verbose {
+					log.Printf("Connection %d failed to create: %v", connID, err)
+				}
+				return
+			}
+			defer client.Close()
+
+			// Test connectivity with ping
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+			defer cancel()
+
+			err = client.Ping(ctx)
+			setupTime := time.Since(connStart)
+
+			if err != nil {
+				atomic.AddInt64(&failureCount, 1)
+				if verbose {
+					log.Printf("Connection %d ping failed: %v", connID, err)
+				}
+			} else {
+				atomic.AddInt64(&successCount, 1)
+				setupStats.RecordLatency(setupTime.Microseconds())
+				if verbose {
+					log.Printf("Connection %d setup successful in %v", connID, setupTime)
+				}
+			}
+		}(i)
+	}
+
+	// Wait for all connections to complete
+	wg.Wait()
+	totalTime := time.Since(startTime)
+
+	// Get final statistics
+	_, success, failed, _, p50, p95, p99 := setupStats.GetStats()
+	maxSetupTime := setupStats.Histogram.Max()
+
+	fmt.Printf("\n=== Connection Setup Results ===\n")
+	fmt.Printf("Total Time: %v\n", totalTime)
+	fmt.Printf("Total Connections Attempted: %d\n", clientCount)
+	fmt.Printf("Successful Connections: %d\n", success)
+	fmt.Printf("Failed Connections: %d\n", failed)
+	fmt.Printf("Success Rate: %.2f%%\n", float64(success)/float64(clientCount)*100)
+	fmt.Printf("Connections per Second: %.2f\n", float64(success)/totalTime.Seconds())
+	fmt.Println()
+	fmt.Printf("Connection Setup Latency Statistics:\n")
+	fmt.Printf("  P50: %d μs (%.2f ms)\n", p50, float64(p50)/1000)
+	fmt.Printf("  P95: %d μs (%.2f ms)\n", p95, float64(p95)/1000)
+	fmt.Printf("  P99: %d μs (%.2f ms)\n", p99, float64(p99)/1000)
+	fmt.Printf("  Max: %d μs (%.2f ms)\n", maxSetupTime, float64(maxSetupTime)/1000)
+	fmt.Println()
+
+	if failed > 0 {
+		fmt.Printf("Note: %d connections failed. Check network connectivity and server capacity.\n", failed)
+	}
+}
+
 func init() {
 	rootCmd.AddCommand(runCmd)
 
@@ -1618,6 +1768,12 @@ func init() {
 	runCmd.Flags().IntP("rps", "r", 0, "Rate limit in requests per second (0 = unlimited)")
 	runCmd.Flags().IntP("timeout", "T", 10, "Operation timeout in seconds")
 	runCmd.Flags().BoolP("verbose", "v", false, "Enable verbose output")
+	runCmd.Flags().Bool("conn-setup-only", false, "Only benchmark connection setup time (create connections + PING as fast as possible)")
+
+	// Profiling Options
+	runCmd.Flags().String("cpu-profile", "", "Write CPU profile to file")
+	runCmd.Flags().String("mem-profile", "", "Write memory profile to file")
+	runCmd.Flags().String("pprof-addr", "", "Enable pprof HTTP server on address (e.g., localhost:6060)")
 
 	// Redis Options (reuse from populate)
 	runCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI")

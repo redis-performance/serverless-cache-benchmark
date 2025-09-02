@@ -7,9 +7,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -236,6 +239,53 @@ func printStats(stats *PerformanceStats, clientCount int) {
 }
 
 func runPopulate(cmd *cobra.Command, args []string) {
+	// Start profiling if requested
+	cpuProfile, _ := cmd.Flags().GetString("cpu-profile")
+	memProfile, _ := cmd.Flags().GetString("mem-profile")
+	pprofAddr, _ := cmd.Flags().GetString("pprof-addr")
+
+	// Start pprof HTTP server if requested
+	if pprofAddr != "" {
+		go func() {
+			fmt.Printf("Starting pprof HTTP server on http://%s/debug/pprof/\n", pprofAddr)
+			if err := http.ListenAndServe(pprofAddr, nil); err != nil {
+				log.Printf("pprof HTTP server failed: %v", err)
+			}
+		}()
+	}
+
+	if cpuProfile != "" {
+		f, err := os.Create(cpuProfile)
+		if err != nil {
+			log.Fatalf("Could not create CPU profile: %v", err)
+		}
+		defer f.Close()
+
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatalf("Could not start CPU profile: %v", err)
+		}
+		defer pprof.StopCPUProfile()
+		fmt.Printf("CPU profiling enabled, writing to: %s\n", cpuProfile)
+	}
+
+	if memProfile != "" {
+		defer func() {
+			f, err := os.Create(memProfile)
+			if err != nil {
+				log.Printf("Could not create memory profile: %v", err)
+				return
+			}
+			defer f.Close()
+
+			runtime.GC() // Get up-to-date statistics
+			if err := pprof.WriteHeapProfile(f); err != nil {
+				log.Printf("Could not write memory profile: %v", err)
+			} else {
+				fmt.Printf("Memory profile written to: %s\n", memProfile)
+			}
+		}()
+	}
+
 	cacheType, _ := cmd.Flags().GetString("cache-type")
 	clientCount, _ := cmd.Flags().GetInt("clients")
 	rps, _ := cmd.Flags().GetInt("rps")
@@ -422,6 +472,11 @@ func init() {
 	populateCmd.Flags().BoolP("verbose", "v", false, "Enable verbose output (show worker details)")
 	populateCmd.Flags().Int("default-ttl", 3600, "Default TTL in seconds for cache entries (0 = no expiration for Redis, 60s minimum for Momento)")
 	populateCmd.Flags().String("csv-output", "", "CSV file to log populate metrics (default: auto-generated filename)")
+
+	// Profiling Options
+	populateCmd.Flags().String("cpu-profile", "", "Write CPU profile to file")
+	populateCmd.Flags().String("mem-profile", "", "Write memory profile to file")
+	populateCmd.Flags().String("pprof-addr", "", "Enable pprof HTTP server on address (e.g., localhost:6060)")
 
 	// Redis Options
 	populateCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI (redis://[username[:password]@]host[:port][/db-number] or rediss:// for TLS)")
