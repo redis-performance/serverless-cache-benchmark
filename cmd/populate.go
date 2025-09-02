@@ -209,9 +209,9 @@ func createCacheClient(cacheType string, cmd *cobra.Command) (CacheClient, error
 	case "momento":
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
 		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
-		createCache, _ := cmd.Flags().GetBool("momento-create-cache")
 		defaultTTL, _ := cmd.Flags().GetInt("default-ttl")
-		client, err := NewMomentoClient(apiKey, cacheName, createCache, defaultTTL)
+		// Don't create cache per worker - it should be created once upfront
+		client, err := NewMomentoClient(apiKey, cacheName, false, defaultTTL)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Momento client: %w", err)
 		}
@@ -400,6 +400,23 @@ func runPopulate(cmd *cobra.Command, args []string) {
 	}
 	fmt.Println()
 
+	// For Momento, create cache once upfront to avoid multiple clients trying to create it
+	if cacheType == "momento" {
+		apiKey, _ := cmd.Flags().GetString("momento-api-key")
+		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
+		createCache, _ := cmd.Flags().GetBool("momento-create-cache")
+
+		if createCache {
+			// Create a temporary client just to create the cache
+			tempClient, err := NewMomentoClient(apiKey, cacheName, true, defaultTTL)
+			if err != nil {
+				log.Fatalf("Failed to create Momento cache: %v", err)
+			}
+			tempClient.Close()
+			fmt.Printf("Momento cache '%s' created/verified\n", cacheName)
+		}
+	}
+
 	// Create shared performance stats
 	perfStats := NewPerformanceStats()
 
@@ -506,6 +523,9 @@ func runPopulate(cmd *cobra.Command, args []string) {
 
 	// Print final statistics
 	printStats(perfStats, clientCount)
+
+	// Print CPU and system summary
+	printSystemSummary()
 }
 
 func init() {
@@ -675,4 +695,49 @@ func createPopulateProgressBar(progress float64, elapsed time.Duration) string {
 	timeStr := fmt.Sprintf("%02d:%02d", minutes, seconds)
 
 	return fmt.Sprintf("%s %s (%.1f%%)", bar, timeStr, progress*100)
+}
+
+// printSystemSummary prints CPU and system resource summary
+func printSystemSummary() {
+	fmt.Printf("\n=== System Resource Summary ===\n")
+
+	// Get current system stats
+	sysStats := getSystemStats()
+	procMemMB := getProcessMemoryMB()
+
+	// Get CPU count
+	cpuCount := runtime.NumCPU()
+
+	// Get Go runtime stats
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	fmt.Printf("CPU Information:\n")
+	fmt.Printf("  CPU Cores: %d\n", cpuCount)
+	fmt.Printf("  Current CPU Usage: %.1f%%\n", sysStats.CPUPercent)
+	fmt.Println()
+
+	fmt.Printf("Memory Information:\n")
+	fmt.Printf("  System Memory: %.2f GB used / %.2f GB total (%.1f%% used)\n",
+		sysStats.MemoryUsedMB/1024, sysStats.MemoryTotalMB/1024,
+		(sysStats.MemoryUsedMB/sysStats.MemoryTotalMB)*100)
+	fmt.Printf("  Process Memory: %.2f GB\n", procMemMB/1024)
+	fmt.Println()
+
+	fmt.Printf("Go Runtime Information:\n")
+	fmt.Printf("  Goroutines: %d\n", runtime.NumGoroutine())
+	fmt.Printf("  Heap Allocated: %.2f MB\n", float64(memStats.Alloc)/1024/1024)
+	fmt.Printf("  Heap System: %.2f MB\n", float64(memStats.HeapSys)/1024/1024)
+	fmt.Printf("  GC Cycles: %d\n", memStats.NumGC)
+	fmt.Printf("  Last GC: %v ago\n", time.Since(time.Unix(0, int64(memStats.LastGC))))
+
+	// Network summary if available
+	if sysStats.NetworkRxMBps > 0 || sysStats.NetworkTxMBps > 0 {
+		fmt.Println()
+		fmt.Printf("Network Information:\n")
+		fmt.Printf("  Network RX: %.3f MB/s (%.0f packets/s)\n", sysStats.NetworkRxMBps, sysStats.NetworkRxPPS)
+		fmt.Printf("  Network TX: %.3f MB/s (%.0f packets/s)\n", sysStats.NetworkTxMBps, sysStats.NetworkTxPPS)
+	}
+
+	fmt.Println()
 }
