@@ -641,15 +641,16 @@ func createAndTestCacheClient(cacheType string, cmd *cobra.Command, stats *Workl
 	}
 
 	// Test connectivity with ping
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	err = client.Ping(ctx)
-	if err != nil {
-		client.Close()
-		return nil, fmt.Errorf("ping failed: %w", err)
-	}
-
+	// PING Already happens under hood when establishing client dont need to do a second time
+	//ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	//defer cancel()
+	//
+	//err = client.Ping(ctx)
+	//if err != nil {
+	//	client.Close()
+	//	return nil, fmt.Errorf("ping failed: %w", err)
+	//}
+	//
 	// Record setup time
 	setupTime := time.Since(setupStart)
 	stats.SetupStats.RecordLatency(setupTime.Microseconds())
@@ -696,8 +697,10 @@ func createCacheClientForRun(cacheType string, cmd *cobra.Command) (CacheClient,
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
 		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
 		defaultTTL, _ := cmd.Flags().GetInt("default-ttl")
+		clientConnCount, _ := cmd.Flags().GetUint32("momento-client-conn-count")
+
 		// Don't create cache per worker - it should be created once upfront
-		client, err := NewMomentoClient(apiKey, cacheName, false, defaultTTL)
+		client, err := NewMomentoClient(apiKey, cacheName, false, defaultTTL, clientConnCount)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Momento client: %w", err)
 		}
@@ -889,10 +892,11 @@ func runWorkload(cmd *cobra.Command, args []string) {
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
 		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
 		createCache, _ := cmd.Flags().GetBool("momento-create-cache")
+		clientConnCount, _ := cmd.Flags().GetUint32("momento-client-conn-count")
 
 		if createCache {
 			// Create a temporary client just to create the cache
-			tempClient, err := NewMomentoClient(apiKey, cacheName, true, defaultTTL)
+			tempClient, err := NewMomentoClient(apiKey, cacheName, true, defaultTTL, clientConnCount)
 			if err != nil {
 				log.Fatalf("Failed to create Momento cache: %v", err)
 			}
@@ -1776,10 +1780,11 @@ func runConnectionSetupBenchmark(cmd *cobra.Command, args []string) {
 			defer client.Close()
 
 			// Test connectivity with ping
-			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
-			defer cancel()
-
-			err = client.Ping(ctx)
+			// PING Already happens under hood when establishing client dont need to do a second time
+			//ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+			//defer cancel()
+			//
+			//err = client.Ping(ctx)
 			setupTime := time.Since(connStart)
 
 			if err != nil {
@@ -1951,6 +1956,7 @@ func init() {
 	runCmd.Flags().String("momento-api-key", "", "Momento API key (or set MOMENTO_API_KEY env var)")
 	runCmd.Flags().String("momento-cache-name", "test-cache", "Momento cache name")
 	runCmd.Flags().Bool("momento-create-cache", true, "Automatically create Momento cache if it doesn't exist")
+	runCmd.Flags().Uint32("momento-client-conn-count", 1, "Set number of TCP conn each momento client creates")
 
 	// Workload-specific Options
 	runCmd.Flags().Float64("key-zipf-exp", 1.0, "Zipf distribution exponent (0 < exp <= 5), higher = more concentration")

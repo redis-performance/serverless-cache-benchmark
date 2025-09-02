@@ -210,8 +210,10 @@ func createCacheClient(cacheType string, cmd *cobra.Command) (CacheClient, error
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
 		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
 		defaultTTL, _ := cmd.Flags().GetInt("default-ttl")
+		clientConnCount, _ := cmd.Flags().GetUint32("momento-client-conn-count")
+
 		// Don't create cache per worker - it should be created once upfront
-		client, err := NewMomentoClient(apiKey, cacheName, false, defaultTTL)
+		client, err := NewMomentoClient(apiKey, cacheName, false, defaultTTL, clientConnCount)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Momento client: %w", err)
 		}
@@ -405,10 +407,11 @@ func runPopulate(cmd *cobra.Command, args []string) {
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
 		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
 		createCache, _ := cmd.Flags().GetBool("momento-create-cache")
+		clientConnCount, _ := cmd.Flags().GetUint32("momento-client-conn-count")
 
 		if createCache {
 			// Create a temporary client just to create the cache
-			tempClient, err := NewMomentoClient(apiKey, cacheName, true, defaultTTL)
+			tempClient, err := NewMomentoClient(apiKey, cacheName, true, defaultTTL, clientConnCount)
 			if err != nil {
 				log.Fatalf("Failed to create Momento cache: %v", err)
 			}

@@ -19,7 +19,7 @@ type MomentoClient struct {
 	cacheName string
 }
 
-func NewMomentoClient(apiKey, cacheName string, createCache bool, defaultTTLSeconds int) (*MomentoClient, error) {
+func NewMomentoClient(apiKey, cacheName string, createCache bool, defaultTTLSeconds int, clientConnectCount uint32) (*MomentoClient, error) {
 	var credential auth.CredentialProvider
 	var err error
 	loggerFactory := momento_default_logger.NewDefaultMomentoLoggerFactory(momento_default_logger.WARN)
@@ -42,8 +42,11 @@ func NewMomentoClient(apiKey, cacheName string, createCache bool, defaultTTLSeco
 		defaultTTL = 60 * time.Second // Momento requires a default TTL
 	}
 
+	if clientConnectCount < 1 {
+		clientConnectCount = 1
+	}
 	client, err := momento.NewCacheClient(
-		config.LaptopLatestWithLogger(loggerFactory),
+		config.LaptopLatestWithLogger(loggerFactory).WithNumGrpcChannels(clientConnectCount),
 		credential,
 		defaultTTL,
 	)
