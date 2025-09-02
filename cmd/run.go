@@ -719,7 +719,7 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	mutexProfileFraction, _ := cmd.Flags().GetInt("mutex-profile-fraction")
 
 	// Enable block profiling if requested
-	if blockProfile != "" || blockProfileRate > 0 {
+	if blockProfile != "" && blockProfileRate > 0 {
 		runtime.SetBlockProfileRate(blockProfileRate)
 		fmt.Printf("Block profiling enabled with rate: %d\n", blockProfileRate)
 
@@ -742,7 +742,7 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	}
 
 	// Enable mutex profiling if requested
-	if mutexProfile != "" || mutexProfileFraction > 0 {
+	if mutexProfile != "" && mutexProfileFraction > 0 {
 		runtime.SetMutexProfileFraction(mutexProfileFraction)
 		fmt.Printf("Mutex profiling enabled with fraction: %d\n", mutexProfileFraction)
 
