@@ -45,10 +45,11 @@ func NewMomentoClient(apiKey, cacheName string, createCache bool, defaultTTLSeco
 	if clientConnectCount < 1 {
 		clientConnectCount = 1
 	}
-	client, err := momento.NewCacheClient(
+	client, err := momento.NewCacheClientWithEagerConnectTimeout(
 		config.LaptopLatestWithLogger(loggerFactory).WithNumGrpcChannels(clientConnectCount),
 		credential,
 		defaultTTL,
+		0*time.Second,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Momento client: %w", err)
