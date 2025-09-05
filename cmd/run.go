@@ -4,6 +4,7 @@ Copyright © 2025 Redis Performance Group  <performance <at> redis <dot> com>
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"encoding/csv"
 	"fmt"
@@ -362,13 +363,14 @@ func parseRatio(ratioStr string) (int, int, error) {
 
 // SystemStats holds lightweight system monitoring data
 type SystemStats struct {
-	MemoryUsedMB  float64
-	MemoryTotalMB float64
-	CPUPercent    float64
-	NetworkRxMBps float64 // Network receive MB/s
-	NetworkTxMBps float64 // Network transmit MB/s
-	NetworkRxPPS  float64 // Network receive packets/s
-	NetworkTxPPS  float64 // Network transmit packets/s
+	MemoryUsedMB     float64
+	MemoryTotalMB    float64
+	CPUPercent       float64
+	NetworkRxMBps    float64 // Network receive MB/s
+	NetworkTxMBps    float64 // Network transmit MB/s
+	NetworkRxPPS     float64 // Network receive packets/s
+	NetworkTxPPS     float64 // Network transmit packets/s
+	OutboundTCPConns int     // Established outbound conn count
 }
 
 // NetworkStats holds network interface statistics
@@ -439,7 +441,49 @@ func getSystemStats() SystemStats {
 		stats.NetworkTxPPS = netStats.NetworkTxPPS
 	}
 
+	//Get established TCP Conn Count
+	files := []string{"/proc/self/net/tcp", "/proc/self/net/tcp6"}
+	totalOutboundConns := 0
+	for _, path := range files {
+		f, err := os.Open(path)
+		if err == nil {
+			sc := bufio.NewScanner(f)
+			if !sc.Scan() { // skip header
+				f.Close()
+				continue
+			}
+			for sc.Scan() {
+				fields := fastSplit(sc.Text())
+				if len(fields) >= 4 && fields[3] == "01" { // ESTABLISHED
+					totalOutboundConns++
+				}
+			}
+			f.Close()
+		}
+	}
+	stats.OutboundTCPConns = totalOutboundConns
+
 	return stats
+}
+
+func fastSplit(s string) []string {
+	res := make([]string, 0, 16)
+	start := -1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != ' ' && c != '\t' {
+			if start < 0 {
+				start = i
+			}
+		} else if start >= 0 {
+			res = append(res, s[start:i])
+			start = -1
+		}
+	}
+	if start >= 0 {
+		res = append(res, s[start:])
+	}
+	return res
 }
 
 // getNetworkStats returns network bandwidth and PPS statistics
@@ -1666,7 +1710,7 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 		select {
 		case <-ctx.Done():
 			// Clear the progress line
-			fmt.Print("\r" + strings.Repeat(" ", 150) + "\r")
+			//fmt.Print("\r" + strings.Repeat(" ", 150) + "\r")
 			return
 		case <-ticker.C:
 			getOps := atomic.LoadInt64(&stats.GetOps)
@@ -1679,14 +1723,11 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 
 			if totalOps > 0 {
 				// Calculate cumulative QPS for CSV logging
-				getQPS := float64(getOps) / elapsed.Seconds()
-				setQPS := float64(setOps) / elapsed.Seconds()
-				totalQPS := getQPS + setQPS
 
 				// Get current second stats for progress bar display
-				getCurrentOps, getP50, getP95, getP99, _ := stats.GetStats.GetCurrentSecondStats()
-				setCurrentOps, setP50, setP95, setP99, _ := stats.SetStats.GetCurrentSecondStats()
-
+				getCurrentOps, getP50, getP95, getP99, getMax := stats.GetStats.GetCurrentSecondStats()
+				setCurrentOps, setP50, setP95, setP99, setMax := stats.SetStats.GetCurrentSecondStats()
+				stats.SetStats.GetCurrentSecondStats()
 				// Calculate current second QPS (operations in current second)
 				currentGetQPS := float64(getCurrentOps)
 				currentSetQPS := float64(setCurrentOps)
@@ -1707,9 +1748,9 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 						TargetClients:   clientCount,
 						ActualClients:   clientCount,
 						TargetQPS:       -1, // Static workload doesn't have target QPS
-						ActualTotalQPS:  totalQPS,
-						ActualGetQPS:    getQPS,
-						ActualSetQPS:    setQPS,
+						ActualTotalQPS:  currentTotalQPS,
+						ActualGetQPS:    currentGetQPS,
+						ActualSetQPS:    currentSetQPS,
 						TotalOps:        totalOps,
 						GetOps:          getOps,
 						SetOps:          setOps,
@@ -1718,11 +1759,11 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 						GetLatencyP50:   getP50,
 						GetLatencyP95:   getP95,
 						GetLatencyP99:   getP99,
-						GetLatencyMax:   stats.GetStats.Histogram.Max(),
+						GetLatencyMax:   getMax,
 						SetLatencyP50:   setP50,
 						SetLatencyP95:   setP95,
 						SetLatencyP99:   setP99,
-						SetLatencyMax:   stats.SetStats.Histogram.Max(),
+						SetLatencyMax:   setMax,
 						NetworkRxMBps:   sysStats.NetworkRxMBps,
 						NetworkTxMBps:   sysStats.NetworkTxMBps,
 						NetworkRxPPS:    sysStats.NetworkRxPPS,
@@ -1735,12 +1776,34 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 					stats.CSVLogger.LogMetrics(snapshot)
 				}
 
-				// Format the progress line with current second stats
-				progressLine := fmt.Sprintf("\r%s | %d clients | %.0f ops/s | GET: %.0f/s | SET: %.0f/s | Mem: %.1fGB/%.1fGB | CPU: %.0f%% | Proc: %.1fGB | Net: %.1f/%.1f MB/s | Get p99: %d μs | Set p99: %d μs",
-					progressBar, clientCount, currentTotalQPS, currentGetQPS, currentSetQPS,
+				progressLine := fmt.Sprintf(
+					"\n%s\n"+
+						"Clients : %d\n"+
+						"\n"+
+						"Throughput\n"+
+						"  Ops/s   : Overall: %.0f  |  GET: %.0f/s  |  SET: %.0f/s\n"+
+						"\n"+
+						"Latency\n"+
+						"  GET     : p50 %.2f ms | p99 %.2f ms\n"+
+						"  SET     : p50 %.2f ms | p99 %.2f ms\n"+
+						"\n"+
+						"System\n"+
+						"  Memory  : %.1fGB / %.1fGB\n"+
+						"  CPU     : %.0f%%\n"+
+						"  ProcMem : %.1fGB\n"+
+						"  Network : Rx %.1f MB/s | Tx %.1f MB/s\n"+
+						"  TotalOutBoundConn : %d",
+					progressBar,
+					clientCount,
+					currentTotalQPS, currentGetQPS, currentSetQPS,
+					float64(getP50)/1000.0, float64(getP99)/1000.0,
+					float64(setP50)/1000.0, float64(setP99)/1000.0,
 					sysStats.MemoryUsedMB/1024, sysStats.MemoryTotalMB/1024,
-					sysStats.CPUPercent, procMemMB/1024, sysStats.NetworkRxMBps, sysStats.NetworkTxMBps,
-					getP99, setP99)
+					sysStats.CPUPercent,
+					procMemMB/1024,
+					sysStats.NetworkRxMBps, sysStats.NetworkTxMBps,
+					sysStats.OutboundTCPConns,
+				)
 
 				fmt.Print(progressLine)
 			}
@@ -1818,7 +1881,7 @@ func printFinalResults(stats *WorkloadStats, testTime int, measureSetup bool) {
 		_, _, _, _, getP50, getP95, getP99 := stats.GetStats.GetStats()
 
 		fmt.Printf("GET Operations: %d\n", getOps)
-		fmt.Printf("GET QPS: %.2f\n", getQPS)
+		fmt.Printf("AVG GET QPS: %.2f\n", getQPS)
 		fmt.Printf("GET Errors: %d (%.2f%%)\n", getErrors, float64(getErrors)/float64(getOps)*100)
 		fmt.Printf("GET Latency - P50: %d μs, P95: %d μs, P99: %d μs\n", getP50, getP95, getP99)
 		fmt.Println()
@@ -1830,7 +1893,7 @@ func printFinalResults(stats *WorkloadStats, testTime int, measureSetup bool) {
 		_, _, _, _, setP50, setP95, setP99 := stats.SetStats.GetStats()
 
 		fmt.Printf("SET Operations: %d\n", setOps)
-		fmt.Printf("SET QPS: %.2f\n", setQPS)
+		fmt.Printf("AVG SET QPS: %.2f\n", setQPS)
 		fmt.Printf("SET Errors: %d (%.2f%%)\n", setErrors, float64(setErrors)/float64(setOps)*100)
 		fmt.Printf("SET Latency - P50: %d μs, P95: %d μs, P99: %d μs\n", setP50, setP95, setP99)
 	}
