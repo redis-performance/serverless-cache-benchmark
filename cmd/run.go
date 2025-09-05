@@ -1565,7 +1565,7 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 
 // reportProgress reports workload progress with a progress bar
 func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(MetricWindowSizeSeconds * time.Second)
 	defer ticker.Stop()
 
 	startTime := time.Now()
@@ -1594,13 +1594,13 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 				targetClients, targetQPS := getCurrentTargetInfo(stats)
 
 				// Get current second stats for progress bar display
-				getCurrentOps, getP50, getP95, getP99, getMax := stats.GetStats.GetCurrentSecondStats()
-				setCurrentOps, setP50, setP95, setP99, setMax := stats.SetStats.GetCurrentSecondStats()
+				getCurrentOps, getP50, getP95, getP99, getMax := stats.GetStats.GetPreviousWindowStats()
+				setCurrentOps, setP50, setP95, setP99, setMax := stats.SetStats.GetPreviousWindowStats()
 
-				// Calculate current second QPS (operations in current second)
-				currentGetQPS := float64(getCurrentOps)
-				currentSetQPS := float64(setCurrentOps)
-				currentTotalQPS := currentGetQPS + currentSetQPS
+				// Calculate current metric window AVG QPS
+				currentWindowGetOps := float64(getCurrentOps / MetricWindowSizeSeconds)
+				currentWindowSetOps := float64(setCurrentOps / MetricWindowSizeSeconds)
+				currentTotalQPS := currentWindowGetOps + currentWindowSetOps
 
 				// Get system resource usage
 				sysStats := getSystemStats()
@@ -1615,8 +1615,8 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 						ActualClients:     currentClients,
 						TargetQPS:         targetQPS,
 						ActualTotalQPS:    currentTotalQPS,
-						ActualGetQPS:      currentGetQPS,
-						ActualSetQPS:      currentSetQPS,
+						ActualGetQPS:      currentWindowGetOps,
+						ActualSetQPS:      currentWindowSetOps,
 						TotalOps:          totalOps,
 						GetOps:            getOps,
 						SetOps:            setOps,
@@ -1663,7 +1663,7 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 						"  TotalOutBoundConn : %d",
 					progressBar,
 					currentClients,
-					currentTotalQPS, currentGetQPS, currentSetQPS,
+					currentTotalQPS, currentWindowGetOps, currentWindowSetOps,
 					float64(getP50)/1000.0, float64(getP99)/1000.0,
 					float64(setP50)/1000.0, float64(setP99)/1000.0,
 					sysStats.MemoryUsedMB/1024, sysStats.MemoryTotalMB/1024,
@@ -1749,7 +1749,7 @@ func getCurrentTargetInfo(stats *WorkloadStats) (int, int) {
 
 // reportStaticProgress reports progress for static workload with progress bar
 func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime int, clientCount int, verbose bool) {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(MetricWindowSizeSeconds * time.Second)
 	defer ticker.Stop()
 
 	startTime := time.Now()
@@ -1772,13 +1772,13 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 
 			if totalOps > 0 {
 				// Get current second stats for progress bar display
-				getCurrentOps, getP50, getP95, getP99, getMax := stats.GetStats.GetCurrentSecondStats()
-				setCurrentOps, setP50, setP95, setP99, setMax := stats.SetStats.GetCurrentSecondStats()
+				getCurrentOps, getP50, getP95, getP99, getMax := stats.GetStats.GetPreviousWindowStats()
+				setCurrentOps, setP50, setP95, setP99, setMax := stats.SetStats.GetPreviousWindowStats()
 
-				// Calculate current second QPS (operations in current second)
-				currentGetQPS := float64(getCurrentOps)
-				currentSetQPS := float64(setCurrentOps)
-				currentTotalQPS := currentGetQPS + currentSetQPS
+				// Calculate current metric window AVG QPS
+				currentWindowGetOps := float64(getCurrentOps / MetricWindowSizeSeconds)
+				currentWindowSetOps := float64(setCurrentOps / MetricWindowSizeSeconds)
+				currentTotalQPS := currentWindowGetOps + currentWindowSetOps
 
 				// Create progress bar for static workload
 				progressBar := createStaticProgressBar(elapsed, totalDuration)
@@ -1796,8 +1796,8 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 						ActualClients:     clientCount,
 						TargetQPS:         -1, // Static workload doesn't have target QPS
 						ActualTotalQPS:    currentTotalQPS,
-						ActualGetQPS:      currentGetQPS,
-						ActualSetQPS:      currentSetQPS,
+						ActualGetQPS:      currentWindowGetOps,
+						ActualSetQPS:      currentWindowSetOps,
 						TotalOps:          totalOps,
 						GetOps:            getOps,
 						SetOps:            setOps,
@@ -1843,7 +1843,7 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 						"  TotalOutBoundConn : %d",
 					progressBar,
 					clientCount,
-					currentTotalQPS, currentGetQPS, currentSetQPS,
+					currentTotalQPS, currentWindowGetOps, currentWindowSetOps,
 					float64(getP50)/1000.0, float64(getP99)/1000.0,
 					float64(setP50)/1000.0, float64(setP99)/1000.0,
 					sysStats.MemoryUsedMB/1024, sysStats.MemoryTotalMB/1024,
