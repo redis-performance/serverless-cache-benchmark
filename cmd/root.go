@@ -4,10 +4,38 @@ Copyright © 2025 Redis Performance Group  <performance <at> redis <dot> com>
 package cmd
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
 )
+
+// Version information
+var (
+	gitSHA1  = "unknown"
+	gitDirty = "unknown"
+)
+
+// SetVersionInfo sets the version information from main
+func SetVersionInfo(sha, dirty string) {
+	gitSHA1 = sha
+	gitDirty = dirty
+}
+
+// versionCmd represents the version command
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print version information",
+	Long:  "Print version information including git commit hash and build time",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("serverless-cache-benchmark\n")
+		fmt.Printf("Git Commit: %s", gitSHA1)
+		if gitDirty != "0" && gitDirty != "unknown" {
+			fmt.Printf(" (dirty)")
+		}
+		fmt.Printf("\n")
+	},
+}
 
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -19,6 +47,20 @@ examples and usage of using your application. For example:
 Cobra is a CLI library for Go that empowers applications.
 This application is a tool to generate the needed files
 to quickly create a Cobra application.`,
+	Run: func(cmd *cobra.Command, args []string) {
+		// Check for --version flag
+		if version, _ := cmd.Flags().GetBool("version"); version {
+			fmt.Printf("serverless-cache-benchmark\n")
+			fmt.Printf("Git Commit: %s", gitSHA1)
+			if gitDirty != "0" && gitDirty != "unknown" {
+				fmt.Printf(" (dirty)")
+			}
+			fmt.Printf("\n")
+			return
+		}
+		// If no version flag, show help
+		cmd.Help()
+	},
 }
 
 // Execute adds all child commands to the root command and sets flags appropriately.
@@ -31,13 +73,10 @@ func Execute() {
 }
 
 func init() {
-	// Here you will define your flags and configuration settings.
-	// Cobra supports persistent flags, which, if defined here,
-	// will be global for your application.
+	// Add version command
+	rootCmd.AddCommand(versionCmd)
 
-	// rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.serverless-cache-benchmark.yaml)")
+	// Add --version flag to root command
+	rootCmd.Flags().BoolP("version", "V", false, "Print version information")
 
-	// Cobra also supports local flags, which will only run
-	// when this action is called directly.
-	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
 }

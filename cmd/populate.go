@@ -239,6 +239,14 @@ func printStats(stats *PerformanceStats, clientCount int) {
 }
 
 func runPopulate(cmd *cobra.Command, args []string) {
+	// Print version info
+	fmt.Printf("serverless-cache-benchmark populate\n")
+	fmt.Printf("Git Commit: %s", gitSHA1)
+	if gitDirty != "0" && gitDirty != "unknown" {
+		fmt.Printf(" (dirty)")
+	}
+	fmt.Printf("\n\n")
+
 	// Start profiling if requested
 	cpuProfile, _ := cmd.Flags().GetString("cpu-profile")
 	memProfile, _ := cmd.Flags().GetString("mem-profile")

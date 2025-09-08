@@ -21,6 +21,8 @@ ifeq ($(GIT_DIRTY),)
 GIT_DIRTY:=$(shell git diff --no-ext-diff 2> /dev/null | wc -l)
 endif
 
+
+
 GCFLAGS:=
 ifeq ($(DEBUG),1)
 GCFLAGS:=-gcflags="all=-N -l"
@@ -36,11 +38,11 @@ build-coverage:
 
 build:
 	$(GOBUILD) \
-	-ldflags="-X 'main.GitSHA1=$(GIT_SHA)'-X 'main.GitDirty=$(GIT_DIRTY)'"  $(GCFLAGS)  .
+	-ldflags="-X 'main.GitSHA1=$(GIT_SHA)' -X 'main.GitDirty=$(GIT_DIRTY)'" $(GCFLAGS) .
 
 build-race:
 	$(GOBUILDRACE) \
-                   	-ldflags="-X 'main.GitSHA1=$(GIT_SHA)' -X 'main.GitDirty=$(GIT_DIRTY)'" .
+	-ldflags="-X 'main.GitSHA1=$(GIT_SHA)' -X 'main.GitDirty=$(GIT_DIRTY)'" .
 
 checkfmt:
 	@echo 'Checking gofmt';\
