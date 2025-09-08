@@ -134,17 +134,19 @@ type MetricsSnapshot struct {
 
 // WorkloadStats tracks workload performance metrics
 type WorkloadStats struct {
-	GetOps       int64
-	SetOps       int64
-	GetErrors    int64
-	SetErrors    int64
-	GetStats     *PerformanceStats
-	SetStats     *PerformanceStats
-	SetupStats   *PerformanceStats // For client setup time measurement
-	TimeBlocks   []TimeBlockStats  // Performance per time block
-	CurrentBlock *TimeBlockStats   // Currently active time block
-	BlockMutex   sync.RWMutex      // Protects time block operations
-	CSVLogger    *CSVLogger        // CSV output logger
+	GetOps            int64
+	SetOps            int64
+	GetErrors         int64
+	SetErrors         int64
+	ActiveConnections int64 // Number of active connections
+	FailedConnections int64 // Number of failed connection attempts
+	GetStats          *PerformanceStats
+	SetStats          *PerformanceStats
+	SetupStats        *PerformanceStats // For client setup time measurement
+	TimeBlocks        []TimeBlockStats  // Performance per time block
+	CurrentBlock      *TimeBlockStats   // Currently active time block
+	BlockMutex        sync.RWMutex      // Protects time block operations
+	CSVLogger         *CSVLogger        // CSV output logger
 }
 
 func NewWorkloadStats() *WorkloadStats {
@@ -640,8 +642,11 @@ func createAndTestCacheClient(cacheType string, cmd *cobra.Command, stats *Workl
 		return nil, err
 	}
 
+	// Get configurable connection timeout
+	connectionTimeout, _ := cmd.Flags().GetInt("connection-timeout")
+
 	// Test connectivity with ping
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(connectionTimeout)*time.Second)
 	defer cancel()
 
 	err = client.Ping(ctx)
@@ -1186,8 +1191,13 @@ func runWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, wo
 	if err != nil {
 		// Always log connection failures as they're critical
 		log.Printf("Worker %d: Failed to create client: %v", workerID, err)
+		atomic.AddInt64(&stats.FailedConnections, 1)
 		return
 	}
+
+	// Track successful connection
+	atomic.AddInt64(&stats.ActiveConnections, 1)
+	defer atomic.AddInt64(&stats.ActiveConnections, -1)
 
 	if verbose && !quiet {
 		log.Printf("Worker %d: Successfully created client connection", workerID)
@@ -1372,11 +1382,15 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 					stats.CSVLogger.LogMetrics(snapshot)
 				}
 
-				// Format the progress line with resource monitoring
-				progressLine := fmt.Sprintf("\r%s | %d clients | %.0f ops/s | GET: %.0f/s | SET: %.0f/s | Mem: %.1fGB/%.1fGB | CPU: %.0f%% | Proc: %.1fGB | Net: %.1f/%.1f MB/s",
-					progressBar, currentClients, totalQPS, getQPS, setQPS,
+				// Get connection stats
+				activeConns := atomic.LoadInt64(&stats.ActiveConnections)
+				failedConns := atomic.LoadInt64(&stats.FailedConnections)
+
+				// Format the progress line with resource monitoring and connection info
+				progressLine := fmt.Sprintf("\r%s | %d clients | %.0f ops/s | GET: %.0f/s | SET: %.0f/s | Conns: %d/%d | Mem: %.1fGB/%.1fGB | CPU: %.0f%% | Net: %.1f/%.1f MB/s",
+					progressBar, currentClients, totalQPS, getQPS, setQPS, activeConns, failedConns,
 					sysStats.MemoryUsedMB/1024, sysStats.MemoryTotalMB/1024,
-					sysStats.CPUPercent, procMemMB/1024, sysStats.NetworkRxMBps, sysStats.NetworkTxMBps)
+					sysStats.CPUPercent, sysStats.NetworkRxMBps, sysStats.NetworkTxMBps)
 
 				// Truncate if too long for terminal
 				if len(progressLine) > 150 {
@@ -1583,6 +1597,8 @@ func printFinalResults(stats *WorkloadStats, testTime int, measureSetup bool) {
 	setOps := atomic.LoadInt64(&stats.SetOps)
 	getErrors := atomic.LoadInt64(&stats.GetErrors)
 	setErrors := atomic.LoadInt64(&stats.SetErrors)
+	activeConns := atomic.LoadInt64(&stats.ActiveConnections)
+	failedConns := atomic.LoadInt64(&stats.FailedConnections)
 
 	totalOps := getOps + setOps
 	totalErrors := getErrors + setErrors
@@ -1594,6 +1610,8 @@ func printFinalResults(stats *WorkloadStats, testTime int, measureSetup bool) {
 	fmt.Printf("Test Duration: %d seconds\n", testTime)
 	fmt.Printf("Total Operations: %d\n", totalOps)
 	fmt.Printf("Total Errors: %d (%.2f%%)\n", totalErrors, float64(totalErrors)/float64(totalOps)*100)
+	fmt.Printf("Active Connections: %d\n", activeConns)
+	fmt.Printf("Failed Connections: %d\n", failedConns)
 	fmt.Println()
 
 	// Client setup statistics (only if measurement was enabled)
@@ -1640,6 +1658,8 @@ func printDynamicFinalResults(stats *WorkloadStats, configs []TrafficConfig, mea
 	setOps := atomic.LoadInt64(&stats.SetOps)
 	getErrors := atomic.LoadInt64(&stats.GetErrors)
 	setErrors := atomic.LoadInt64(&stats.SetErrors)
+	activeConns := atomic.LoadInt64(&stats.ActiveConnections)
+	failedConns := atomic.LoadInt64(&stats.FailedConnections)
 
 	totalOps := getOps + setOps
 	totalErrors := getErrors + setErrors
@@ -1650,6 +1670,8 @@ func printDynamicFinalResults(stats *WorkloadStats, configs []TrafficConfig, mea
 
 	fmt.Printf("Total Operations: %d\n", totalOps)
 	fmt.Printf("Total Errors: %d (%.2f%%)\n", totalErrors, float64(totalErrors)/float64(totalOps)*100)
+	fmt.Printf("Active Connections: %d\n", activeConns)
+	fmt.Printf("Failed Connections: %d\n", failedConns)
 	fmt.Println()
 
 	// Overall statistics
@@ -1938,11 +1960,11 @@ func init() {
 	// Redis Options (reuse from populate)
 	runCmd.Flags().StringP("redis-uri", "u", "redis://localhost:6379", "Redis URI")
 	runCmd.Flags().Bool("cluster-mode", false, "Run client in cluster mode")
-	runCmd.Flags().Int("redis-dial-timeout", 10, "Redis dial timeout in seconds")
-	runCmd.Flags().Int("redis-read-timeout", 10, "Redis read timeout in seconds")
-	runCmd.Flags().Int("redis-write-timeout", 10, "Redis write timeout in seconds")
-	runCmd.Flags().Int("redis-pool-timeout", 30, "Redis connection pool timeout in seconds")
-	runCmd.Flags().Int("redis-conn-max-idle-time", 30, "Redis connection max idle time in seconds")
+	runCmd.Flags().Int("redis-dial-timeout", 60, "Redis dial timeout in seconds")
+	runCmd.Flags().Int("redis-read-timeout", 60, "Redis read timeout in seconds")
+	runCmd.Flags().Int("redis-write-timeout", 60, "Redis write timeout in seconds")
+	runCmd.Flags().Int("redis-pool-timeout", 120, "Redis connection pool timeout in seconds")
+	runCmd.Flags().Int("redis-conn-max-idle-time", 120, "Redis connection max idle time in seconds")
 	runCmd.Flags().Int("redis-max-retries", 3, "Redis maximum number of retries")
 	runCmd.Flags().Int("redis-min-retry-backoff", 1000, "Redis minimum retry backoff in milliseconds")
 	runCmd.Flags().Int("redis-max-retry-backoff", 10000, "Redis maximum retry backoff in milliseconds")
@@ -1951,6 +1973,7 @@ func init() {
 	runCmd.Flags().String("momento-api-key", "", "Momento API key (or set MOMENTO_API_KEY env var)")
 	runCmd.Flags().String("momento-cache-name", "test-cache", "Momento cache name")
 	runCmd.Flags().Bool("momento-create-cache", true, "Automatically create Momento cache if it doesn't exist")
+	runCmd.Flags().Int("connection-timeout", 180, "Connection timeout in seconds for client creation and ping")
 
 	// Workload-specific Options
 	runCmd.Flags().Float64("key-zipf-exp", 1.0, "Zipf distribution exponent (0 < exp <= 5), higher = more concentration")
