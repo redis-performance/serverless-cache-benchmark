@@ -101,35 +101,36 @@ type CSVLogger struct {
 
 // MetricsSnapshot represents a point-in-time snapshot of metrics
 type MetricsSnapshot struct {
-	Timestamp       time.Time
-	ElapsedSeconds  int
-	TargetClients   int
-	ActualClients   int
-	TargetQPS       int
-	ActualTotalQPS  float64
-	ActualGetQPS    float64
-	ActualSetQPS    float64
-	TotalOps        int64
-	GetOps          int64
-	SetOps          int64
-	GetErrors       int64
-	SetErrors       int64
-	GetLatencyP50   int64
-	GetLatencyP95   int64
-	GetLatencyP99   int64
-	GetLatencyMax   int64
-	SetLatencyP50   int64
-	SetLatencyP95   int64
-	SetLatencyP99   int64
-	SetLatencyMax   int64
-	NetworkRxMBps   float64
-	NetworkTxMBps   float64
-	NetworkRxPPS    float64
-	NetworkTxPPS    float64
-	MemoryUsedGB    float64
-	MemoryTotalGB   float64
-	CPUPercent      float64
-	ProcessMemoryGB float64
+	Timestamp         time.Time
+	ElapsedSeconds    int
+	TargetClients     int
+	ActualClients     int
+	FailedConnections int64
+	TargetQPS         int
+	ActualTotalQPS    float64
+	ActualGetQPS      float64
+	ActualSetQPS      float64
+	TotalOps          int64
+	GetOps            int64
+	SetOps            int64
+	GetErrors         int64
+	SetErrors         int64
+	GetLatencyP50     int64
+	GetLatencyP95     int64
+	GetLatencyP99     int64
+	GetLatencyMax     int64
+	SetLatencyP50     int64
+	SetLatencyP95     int64
+	SetLatencyP99     int64
+	SetLatencyMax     int64
+	NetworkRxMBps     float64
+	NetworkTxMBps     float64
+	NetworkRxPPS      float64
+	NetworkTxPPS      float64
+	MemoryUsedGB      float64
+	MemoryTotalGB     float64
+	CPUPercent        float64
+	ProcessMemoryGB   float64
 }
 
 // WorkloadStats tracks workload performance metrics
@@ -173,7 +174,7 @@ func NewCSVLogger(filename string) (*CSVLogger, error) {
 
 	// Write CSV header
 	header := []string{
-		"timestamp", "elapsed_seconds", "target_clients", "actual_clients", "target_qps",
+		"timestamp", "elapsed_seconds", "target_clients", "actual_clients", "failed_connections", "target_qps",
 		"actual_total_qps", "actual_get_qps", "actual_set_qps",
 		"total_ops", "get_ops", "set_ops", "get_errors", "set_errors",
 		"get_latency_p50_us", "get_latency_p95_us", "get_latency_p99_us", "get_latency_max_us",
@@ -206,6 +207,7 @@ func (cl *CSVLogger) LogMetrics(snapshot MetricsSnapshot) error {
 		strconv.Itoa(snapshot.ElapsedSeconds),
 		strconv.Itoa(snapshot.TargetClients),
 		strconv.Itoa(snapshot.ActualClients),
+		strconv.FormatInt(snapshot.FailedConnections, 10),
 		targetQPSStr,
 		fmt.Sprintf("%.2f", snapshot.ActualTotalQPS),
 		fmt.Sprintf("%.2f", snapshot.ActualGetQPS),
@@ -944,6 +946,8 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData bool, defaultTTL int, measureSetup, verbose, quiet bool,
 	timeoutSeconds, testTime int, stats *WorkloadStats) {
 
+	connectionDelayMs, _ := cmd.Flags().GetInt("connection-delay-ms")
+
 	// Parse ratio
 	setRatio, getRatio, err := parseRatio(ratioStr)
 	if err != nil {
@@ -988,6 +992,12 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 		}
 
 		wg.Add(1)
+
+		// Add connection delay to prevent connection storms
+		if connectionDelayMs > 0 {
+			time.Sleep(time.Duration(connectionDelayMs) * time.Millisecond)
+		}
+
 		// Let each worker create its own connection in parallel
 		go runWorkerWithConnectionCreation(ctx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
 			generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
@@ -1221,7 +1231,7 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 	cmd *cobra.Command, generator *DataGenerator, stats *WorkloadStats,
 	setRatio, getRatio int, keyPrefix string, keyMin, totalKeys int, zipfExp float64,
 	measureSetup, verbose, quiet bool, timeoutSeconds int) {
-
+	connectionDelayMs, _ := cmd.Flags().GetInt("connection-delay-ms")
 	var activeWorkers []context.CancelFunc
 	var wg sync.WaitGroup
 	startTime := time.Now()
@@ -1290,6 +1300,12 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 				activeWorkers = append(activeWorkers, workerCancel)
 
 				wg.Add(1)
+
+				// Add connection delay to prevent connection storms
+				if connectionDelayMs > 0 {
+					time.Sleep(time.Duration(connectionDelayMs) * time.Millisecond)
+				}
+
 				// Pass connection creation parameters to worker - let it create connection in parallel
 				go runWorkerWithConnectionCreation(workerCtx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
 					generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
@@ -1356,36 +1372,41 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 
 				// Create metrics snapshot and log to CSV
 				if stats.CSVLogger != nil {
+					// Get connection stats
+					activeConns := atomic.LoadInt64(&stats.ActiveConnections)
+					failedConns := atomic.LoadInt64(&stats.FailedConnections)
+
 					snapshot := MetricsSnapshot{
-						Timestamp:       time.Now(),
-						ElapsedSeconds:  int(elapsed.Seconds()),
-						TargetClients:   targetClients,
-						ActualClients:   currentClients,
-						TargetQPS:       targetQPS,
-						ActualTotalQPS:  totalQPS,
-						ActualGetQPS:    getQPS,
-						ActualSetQPS:    setQPS,
-						TotalOps:        totalOps,
-						GetOps:          getOps,
-						SetOps:          setOps,
-						GetErrors:       getErrors,
-						SetErrors:       setErrors,
-						GetLatencyP50:   getP50,
-						GetLatencyP95:   getP95,
-						GetLatencyP99:   getP99,
-						GetLatencyMax:   stats.GetStats.Histogram.Max(),
-						SetLatencyP50:   setP50,
-						SetLatencyP95:   setP95,
-						SetLatencyP99:   setP99,
-						SetLatencyMax:   stats.SetStats.Histogram.Max(),
-						NetworkRxMBps:   sysStats.NetworkRxMBps,
-						NetworkTxMBps:   sysStats.NetworkTxMBps,
-						NetworkRxPPS:    sysStats.NetworkRxPPS,
-						NetworkTxPPS:    sysStats.NetworkTxPPS,
-						MemoryUsedGB:    sysStats.MemoryUsedMB / 1024,
-						MemoryTotalGB:   sysStats.MemoryTotalMB / 1024,
-						CPUPercent:      sysStats.CPUPercent,
-						ProcessMemoryGB: procMemMB / 1024,
+						Timestamp:         time.Now(),
+						ElapsedSeconds:    int(elapsed.Seconds()),
+						TargetClients:     targetClients,
+						ActualClients:     int(activeConns),
+						FailedConnections: failedConns,
+						TargetQPS:         targetQPS,
+						ActualTotalQPS:    totalQPS,
+						ActualGetQPS:      getQPS,
+						ActualSetQPS:      setQPS,
+						TotalOps:          totalOps,
+						GetOps:            getOps,
+						SetOps:            setOps,
+						GetErrors:         getErrors,
+						SetErrors:         setErrors,
+						GetLatencyP50:     getP50,
+						GetLatencyP95:     getP95,
+						GetLatencyP99:     getP99,
+						GetLatencyMax:     stats.GetStats.Histogram.Max(),
+						SetLatencyP50:     setP50,
+						SetLatencyP95:     setP95,
+						SetLatencyP99:     setP99,
+						SetLatencyMax:     stats.SetStats.Histogram.Max(),
+						NetworkRxMBps:     sysStats.NetworkRxMBps,
+						NetworkTxMBps:     sysStats.NetworkTxMBps,
+						NetworkRxPPS:      sysStats.NetworkRxPPS,
+						NetworkTxPPS:      sysStats.NetworkTxPPS,
+						MemoryUsedGB:      sysStats.MemoryUsedMB / 1024,
+						MemoryTotalGB:     sysStats.MemoryTotalMB / 1024,
+						CPUPercent:        sysStats.CPUPercent,
+						ProcessMemoryGB:   procMemMB / 1024,
 					}
 					stats.CSVLogger.LogMetrics(snapshot)
 				}
@@ -1515,36 +1536,41 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 
 				// Create metrics snapshot and log to CSV
 				if stats.CSVLogger != nil {
+					// Get connection stats
+					activeConns := atomic.LoadInt64(&stats.ActiveConnections)
+					failedConns := atomic.LoadInt64(&stats.FailedConnections)
+
 					snapshot := MetricsSnapshot{
-						Timestamp:       time.Now(),
-						ElapsedSeconds:  int(elapsed.Seconds()),
-						TargetClients:   clientCount,
-						ActualClients:   clientCount,
-						TargetQPS:       -1, // Static workload doesn't have target QPS
-						ActualTotalQPS:  totalQPS,
-						ActualGetQPS:    getQPS,
-						ActualSetQPS:    setQPS,
-						TotalOps:        totalOps,
-						GetOps:          getOps,
-						SetOps:          setOps,
-						GetErrors:       getErrors,
-						SetErrors:       setErrors,
-						GetLatencyP50:   getP50,
-						GetLatencyP95:   getP95,
-						GetLatencyP99:   getP99,
-						GetLatencyMax:   stats.GetStats.Histogram.Max(),
-						SetLatencyP50:   setP50,
-						SetLatencyP95:   setP95,
-						SetLatencyP99:   setP99,
-						SetLatencyMax:   stats.SetStats.Histogram.Max(),
-						NetworkRxMBps:   sysStats.NetworkRxMBps,
-						NetworkTxMBps:   sysStats.NetworkTxMBps,
-						NetworkRxPPS:    sysStats.NetworkRxPPS,
-						NetworkTxPPS:    sysStats.NetworkTxPPS,
-						MemoryUsedGB:    sysStats.MemoryUsedMB / 1024,
-						MemoryTotalGB:   sysStats.MemoryTotalMB / 1024,
-						CPUPercent:      sysStats.CPUPercent,
-						ProcessMemoryGB: procMemMB / 1024,
+						Timestamp:         time.Now(),
+						ElapsedSeconds:    int(elapsed.Seconds()),
+						TargetClients:     clientCount,
+						ActualClients:     int(activeConns),
+						FailedConnections: failedConns,
+						TargetQPS:         -1, // Static workload doesn't have target QPS
+						ActualTotalQPS:    totalQPS,
+						ActualGetQPS:      getQPS,
+						ActualSetQPS:      setQPS,
+						TotalOps:          totalOps,
+						GetOps:            getOps,
+						SetOps:            setOps,
+						GetErrors:         getErrors,
+						SetErrors:         setErrors,
+						GetLatencyP50:     getP50,
+						GetLatencyP95:     getP95,
+						GetLatencyP99:     getP99,
+						GetLatencyMax:     stats.GetStats.Histogram.Max(),
+						SetLatencyP50:     setP50,
+						SetLatencyP95:     setP95,
+						SetLatencyP99:     setP99,
+						SetLatencyMax:     stats.SetStats.Histogram.Max(),
+						NetworkRxMBps:     sysStats.NetworkRxMBps,
+						NetworkTxMBps:     sysStats.NetworkTxMBps,
+						NetworkRxPPS:      sysStats.NetworkRxPPS,
+						NetworkTxPPS:      sysStats.NetworkTxPPS,
+						MemoryUsedGB:      sysStats.MemoryUsedMB / 1024,
+						MemoryTotalGB:     sysStats.MemoryTotalMB / 1024,
+						CPUPercent:        sysStats.CPUPercent,
+						ProcessMemoryGB:   procMemMB / 1024,
 					}
 					stats.CSVLogger.LogMetrics(snapshot)
 				}
@@ -1982,6 +2008,7 @@ func init() {
 	runCmd.Flags().String("momento-cache-name", "test-cache", "Momento cache name")
 	runCmd.Flags().Bool("momento-create-cache", true, "Automatically create Momento cache if it doesn't exist")
 	runCmd.Flags().Int("connection-timeout", 180, "Connection timeout in seconds for client creation and ping")
+	runCmd.Flags().Int("connection-delay-ms", 0, "Delay in milliseconds between worker connection attempts (helps with connection storms)")
 
 	// Workload-specific Options
 	runCmd.Flags().Float64("key-zipf-exp", 1.0, "Zipf distribution exponent (0 < exp <= 5), higher = more concentration")
