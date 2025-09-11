@@ -25,6 +25,7 @@ type RedisConfig struct {
 	MinRetryBackoff time.Duration
 	MaxRetryBackoff time.Duration
 	ClusterMode     bool
+	PoolSize        int
 }
 
 func NewRedisClientFromURI(uri string, config RedisConfig) (*RedisClient, error) {
@@ -45,6 +46,13 @@ func NewRedisClientFromURI(uri string, config RedisConfig) (*RedisClient, error)
 	opts.MaxRetries = config.MaxRetries
 	opts.MinRetryBackoff = config.MinRetryBackoff
 	opts.MaxRetryBackoff = config.MaxRetryBackoff
+
+	// Set pool size
+	if config.PoolSize > 0 {
+		opts.PoolSize = config.PoolSize
+		opts.MinIdleConns = config.PoolSize
+		opts.MaxIdleConns = config.PoolSize
+	}
 
 	rdb := redis.NewClient(opts)
 	return &RedisClient{client: rdb, isCluster: false}, nil
@@ -68,6 +76,11 @@ func NewRedisClusterClientFromURI(uri string, config RedisConfig) (*RedisClient,
 		MaxRetries:      config.MaxRetries,
 		MinRetryBackoff: config.MinRetryBackoff,
 		MaxRetryBackoff: config.MaxRetryBackoff,
+	}
+
+	// Set pool size
+	if config.PoolSize > 0 {
+		clusterOpts.PoolSize = config.PoolSize
 	}
 
 	// Apply TLS settings if the URI uses rediss://

@@ -903,6 +903,7 @@ func createCacheClientForRun(ctx context.Context, cacheType string, cmd *cobra.C
 		maxRetries, _ := cmd.Flags().GetInt("redis-max-retries")
 		minRetryBackoff, _ := cmd.Flags().GetInt("redis-min-retry-backoff")
 		maxRetryBackoff, _ := cmd.Flags().GetInt("redis-max-retry-backoff")
+		poolSize, _ := cmd.Flags().GetInt("redis-pool-size")
 
 		config := RedisConfig{
 			DialTimeout:     time.Duration(dialTimeout) * time.Second,
@@ -914,6 +915,7 @@ func createCacheClientForRun(ctx context.Context, cacheType string, cmd *cobra.C
 			MinRetryBackoff: time.Duration(minRetryBackoff) * time.Millisecond,
 			MaxRetryBackoff: time.Duration(maxRetryBackoff) * time.Millisecond,
 			ClusterMode:     clusterMode,
+			PoolSize:        poolSize,
 		}
 
 		client, err := NewRedisClientFromURI(uri, config)
@@ -1246,6 +1248,12 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 		case "momento":
 			go runMomentoWorkerWithConnectionCreation(ctx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
 				generator, stats, workerCount, setRatio, getRatio, keyPrefix, keyMin, limiter,
+				timeoutSeconds, measureSetup, verbose, quiet)
+		case "redis":
+			// Get Redis worker count
+			redisWorkerCount, _ := cmd.Flags().GetInt("redis-client-worker-count")
+			go runRedisWorkerWithConnectionCreation(ctx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
+				generator, stats, redisWorkerCount, setRatio, getRatio, keyPrefix, keyMin, limiter,
 				timeoutSeconds, measureSetup, verbose, quiet)
 		default:
 			go runWorkerWithConnectionCreation(ctx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
@@ -1679,6 +1687,78 @@ func runMomentoWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGr
 		setRatio, getRatio, keyPrefix, workerCount, keyMin, limiter, timeoutSeconds, verbose)
 }
 
+// runRedisWorkerWithConnectionCreation creates its own connection and then runs the worker with multiple workers per client
+func runRedisWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, workerID int,
+	cacheType string, cmd *cobra.Command, totalKeys int, zipfExp float64,
+	generator *DataGenerator, stats *WorkloadStats, workerCount int, setRatio, getRatio int,
+	keyPrefix string, keyMin int, limiter *rate.Limiter, timeoutSeconds int,
+	measureSetup, verbose, quiet bool) {
+
+	defer wg.Done()
+
+	// Create cache client in this goroutine (parallel connection creation)
+	var client CacheClient
+	var err error
+
+	if measureSetup {
+		client, err = createAndTestCacheClient(ctx, cacheType, cmd, stats)
+	} else {
+		client, err = createCacheClientForRun(ctx, cacheType, cmd)
+	}
+
+	if err != nil {
+		// Always log connection failures as they're critical
+		log.Printf("Worker %d: Failed to create client: %v", workerID, err)
+		atomic.AddInt64(&stats.FailedConnections, 1)
+		return
+	}
+
+	// Track successful connection
+	atomic.AddInt64(&stats.ActiveConnections, 1)
+	defer func() {
+		atomic.AddInt64(&stats.ActiveConnections, -1)
+		client.Close()
+	}()
+
+	if verbose && !quiet {
+		poolSize, _ := cmd.Flags().GetInt("redis-pool-size")
+		log.Printf("Worker %d: Successfully created Redis client with pool size %d and %d workers", workerID, poolSize, workerCount)
+	}
+
+	// Now run the Redis worker routine with multiple workers per client
+	runRedisWorkerInternal(ctx, workerID, client, totalKeys, zipfExp, generator, stats,
+		setRatio, getRatio, keyPrefix, workerCount, keyMin, limiter, timeoutSeconds, verbose)
+}
+
+// runRedisWorkerInternal contains the actual Redis worker logic with multiple workers per client
+func runRedisWorkerInternal(ctx context.Context, workerID int, client CacheClient,
+	totalKeys int, zipfExp float64, generator *DataGenerator, stats *WorkloadStats,
+	setRatio, getRatio int, keyPrefix string, workerCount int, keyMin int,
+	limiter *rate.Limiter, timeoutSeconds int, verbose bool) {
+
+	// Create a worker-specific Zipf generator with unique seed to ensure different key patterns
+	seed := time.Now().UnixNano() + int64(workerID*1000)
+	if verbose {
+		fmt.Printf("Worker %d: Creating Zipf generator with totalKeys=%d, zipfExp=%f, seed=%d\n",
+			workerID, totalKeys, zipfExp, seed)
+	}
+	zipfGen := NewZipfGenerator(uint64(totalKeys), zipfExp, seed)
+
+	totalRatio := setRatio + getRatio
+	if totalRatio == 0 {
+		return // Nothing to do
+	}
+
+	var opCount int64
+	if verbose {
+		fmt.Printf("Worker %d: Using producer-consumer batching with %d consumers\n", workerID, workerCount)
+	}
+
+	// Use producer-consumer model for continuous request processing (same as Momento)
+	runProducerConsumer(ctx, workerID, client, totalKeys, zipfExp, generator, stats,
+		setRatio, getRatio, keyPrefix, keyMin, timeoutSeconds, workerCount, &opCount, zipfGen, verbose, limiter)
+}
+
 // manageTrafficPattern manages dynamic client scaling and QPS changes
 func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheType string,
 	cmd *cobra.Command, generator *DataGenerator, stats *WorkloadStats,
@@ -1760,9 +1840,10 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 				}
 				switch cacheType {
 				case "redis":
-					// Pass connection creation parameters to worker - let it create connection in parallel
-					go runWorkerWithConnectionCreation(workerCtx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
-						generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
+					// Get Redis worker count
+					redisWorkerCount, _ := cmd.Flags().GetInt("redis-client-worker-count")
+					go runRedisWorkerWithConnectionCreation(workerCtx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
+						generator, stats, redisWorkerCount, setRatio, getRatio, keyPrefix, keyMin, limiter,
 						timeoutSeconds, measureSetup, verbose, quiet)
 				case "momento":
 					go runMomentoWorkerWithConnectionCreation(workerCtx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
@@ -2514,6 +2595,8 @@ func init() {
 	runCmd.Flags().Int("redis-max-retries", 3, "Redis maximum number of retries")
 	runCmd.Flags().Int("redis-min-retry-backoff", 1000, "Redis minimum retry backoff in milliseconds")
 	runCmd.Flags().Int("redis-max-retry-backoff", 10000, "Redis maximum retry backoff in milliseconds")
+	runCmd.Flags().Int("redis-pool-size", 10, "Redis connection pool size per worker")
+	runCmd.Flags().Int("redis-client-worker-count", 1, "Set number of workload generators for each redis client")
 
 	// Momento Options (reuse from populate)
 	runCmd.Flags().String("momento-api-key", "", "Momento API key (or set MOMENTO_API_KEY env var)")

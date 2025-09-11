@@ -198,6 +198,7 @@ func createCacheClient(cacheType string, cmd *cobra.Command) (CacheClient, error
 			MinRetryBackoff: time.Duration(minRetryBackoff) * time.Millisecond,
 			MaxRetryBackoff: time.Duration(maxRetryBackoff) * time.Millisecond,
 			ClusterMode:     clusterMode,
+			PoolSize:        10, // Default pool size for populate
 		}
 
 		client, err := NewRedisClientFromURI(uri, config)
