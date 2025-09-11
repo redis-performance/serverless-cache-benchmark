@@ -7,6 +7,8 @@ import (
 	"github.com/HdrHistogram/hdrhistogram-go"
 )
 
+const MetricWindowSizeSeconds = 5
+
 // LatencyEvent represents a latency measurement event
 type LatencyEvent struct {
 	LatencyMicros int64
@@ -27,9 +29,9 @@ type PerformanceStats struct {
 	done           chan struct{}
 
 	// Per-second histograms (only accessed by stats goroutine)
-	currentSecond    int64
-	currentHistogram *hdrhistogram.Histogram
-	secondHistograms map[int64]*hdrhistogram.Histogram
+	currentWindowStartSecond int64
+	currentHistogram         *hdrhistogram.Histogram
+	windowedHistograms       map[int64]*hdrhistogram.Histogram
 }
 
 func NewPerformanceStats() *PerformanceStats {
@@ -37,13 +39,13 @@ func NewPerformanceStats() *PerformanceStats {
 	hist := hdrhistogram.New(1, 60*1000*1000, 3)
 
 	ps := &PerformanceStats{
-		Histogram:        hist,
-		StartTime:        time.Now(),
-		secondHistograms: make(map[int64]*hdrhistogram.Histogram),
-		currentHistogram: hdrhistogram.New(1, 60*1000*1000, 3),
-		latencyChannel:   make(chan LatencyEvent, 1000000), // Buffered channel to prevent blocking
-		errorChannel:     make(chan struct{}, 100),         // Buffered for errors
-		done:             make(chan struct{}),
+		Histogram:          hist,
+		StartTime:          time.Now(),
+		windowedHistograms: make(map[int64]*hdrhistogram.Histogram),
+		currentHistogram:   hdrhistogram.New(1, 60*1000*1000, 3),
+		latencyChannel:     make(chan LatencyEvent, 1000000), // Buffered channel to prevent blocking
+		errorChannel:       make(chan struct{}, 100),         // Buffered for errors
+		done:               make(chan struct{}),
 	}
 
 	// Start the stats collection goroutine
@@ -57,17 +59,17 @@ func (ps *PerformanceStats) statsCollector() {
 	for {
 		select {
 		case event := <-ps.latencyChannel:
-			second := event.Timestamp.Unix()
+			currentSecond := event.Timestamp.Unix()
 
 			// Record in overall histogram (no lock needed, single goroutine)
 			ps.Histogram.RecordValue(event.LatencyMicros)
 
-			// Record in per-second histogram (no lock needed, single goroutine)
-			if second != ps.currentSecond {
+			// Record in current monitoring window histogram (no lock needed, single goroutine)
+			if currentSecond-ps.currentWindowStartSecond >= MetricWindowSizeSeconds {
 				if ps.currentHistogram.TotalCount() > 0 {
-					ps.secondHistograms[ps.currentSecond] = ps.currentHistogram
+					ps.windowedHistograms[ps.currentWindowStartSecond] = ps.currentHistogram
 				}
-				ps.currentSecond = second
+				ps.currentWindowStartSecond = currentSecond
 				ps.currentHistogram = hdrhistogram.New(1, 60*1000*1000, 3)
 			}
 			ps.currentHistogram.RecordValue(event.LatencyMicros)
@@ -137,19 +139,19 @@ func (ps *PerformanceStats) GetStats() (int64, int64, int64, float64, int64, int
 	return total, success, failed, qps, p50, p95, p99
 }
 
-// GetCurrentSecondStats returns stats for the current second
-// Note: This may return slightly stale data since we're not using locks,
-// but this is acceptable for monitoring purposes and eliminates contention
-func (ps *PerformanceStats) GetCurrentSecondStats() (int64, int64, int64, int64, int64) {
-	if ps.currentHistogram == nil || ps.currentHistogram.TotalCount() == 0 {
+// GetPreviousWindowStats returns stats for the previous metrics window. We want to return previous window vs current since
+// current metric window can still be filling up and have stale/incomplete data since were not using locks on these.
+func (ps *PerformanceStats) GetPreviousWindowStats() (int64, int64, int64, int64, int64) {
+	histToUse := ps.windowedHistograms[ps.currentWindowStartSecond-MetricWindowSizeSeconds]
+	if histToUse == nil || histToUse.TotalCount() == 0 {
 		return 0, 0, 0, 0, 0
 	}
 
-	return ps.currentHistogram.TotalCount(),
-		ps.currentHistogram.ValueAtQuantile(50),
-		ps.currentHistogram.ValueAtQuantile(95),
-		ps.currentHistogram.ValueAtQuantile(99),
-		ps.currentHistogram.Max()
+	return histToUse.TotalCount(),
+		histToUse.ValueAtQuantile(50),
+		histToUse.ValueAtQuantile(95),
+		histToUse.ValueAtQuantile(99),
+		histToUse.Max()
 }
 
 // GetOverallStats returns overall statistics

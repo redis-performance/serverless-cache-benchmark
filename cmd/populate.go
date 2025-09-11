@@ -210,8 +210,10 @@ func createCacheClient(cacheType string, cmd *cobra.Command) (CacheClient, error
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
 		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
 		defaultTTL, _ := cmd.Flags().GetInt("default-ttl")
+		clientConnCount, _ := cmd.Flags().GetUint32("momento-client-conn-count")
+
 		// Don't create cache per worker - it should be created once upfront
-		client, err := NewMomentoClient(apiKey, cacheName, false, defaultTTL)
+		client, err := NewMomentoClient(context.Background(), apiKey, cacheName, false, defaultTTL, clientConnCount)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Momento client: %w", err)
 		}
@@ -413,10 +415,11 @@ func runPopulate(cmd *cobra.Command, args []string) {
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
 		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
 		createCache, _ := cmd.Flags().GetBool("momento-create-cache")
+		clientConnCount, _ := cmd.Flags().GetUint32("momento-client-conn-count")
 
 		if createCache {
 			// Create a temporary client just to create the cache
-			tempClient, err := NewMomentoClient(apiKey, cacheName, true, defaultTTL)
+			tempClient, err := NewMomentoClient(context.Background(), apiKey, cacheName, true, defaultTTL, clientConnCount)
 			if err != nil {
 				log.Fatalf("Failed to create Momento cache: %v", err)
 			}
@@ -643,35 +646,36 @@ func reportPopulateProgress(ctx context.Context, stats *PopulateStats, totalKeys
 					_, _, _, _, p50, p95, p99 := stats.PerfStats.GetStats()
 
 					snapshot := MetricsSnapshot{
-						Timestamp:       time.Now(),
-						ElapsedSeconds:  int(elapsed.Seconds()),
-						TargetClients:   0,  // Not applicable for populate
-						ActualClients:   0,  // Not applicable for populate
-						TargetQPS:       -1, // Not applicable for populate
-						ActualTotalQPS:  qps,
-						ActualGetQPS:    0, // Only SET operations in populate
-						ActualSetQPS:    qps,
-						TotalOps:        totalOps,
-						GetOps:          0,
-						SetOps:          successOps,
-						GetErrors:       0,
-						SetErrors:       failedOps,
-						GetLatencyP50:   0, // GET latencies not applicable
-						GetLatencyP95:   0,
-						GetLatencyP99:   0,
-						GetLatencyMax:   0,
-						SetLatencyP50:   p50, // Use performance stats for SET latencies
-						SetLatencyP95:   p95,
-						SetLatencyP99:   p99,
-						SetLatencyMax:   stats.PerfStats.Histogram.Max(),
-						NetworkRxMBps:   sysStats.NetworkRxMBps,
-						NetworkTxMBps:   sysStats.NetworkTxMBps,
-						NetworkRxPPS:    sysStats.NetworkRxPPS,
-						NetworkTxPPS:    sysStats.NetworkTxPPS,
-						MemoryUsedGB:    sysStats.MemoryUsedMB / 1024,
-						MemoryTotalGB:   sysStats.MemoryTotalMB / 1024,
-						CPUPercent:      sysStats.CPUPercent,
-						ProcessMemoryGB: procMemMB / 1024,
+						Timestamp:         time.Now(),
+						ElapsedSeconds:    int(elapsed.Seconds()),
+						TargetClients:     0,  // Not applicable for populate
+						ActualClients:     0,  // Not applicable for populate
+						TargetQPS:         -1, // Not applicable for populate
+						ActualTotalQPS:    qps,
+						ActualGetQPS:      0, // Only SET operations in populate
+						ActualSetQPS:      qps,
+						TotalOps:          totalOps,
+						GetOps:            0,
+						SetOps:            successOps,
+						GetErrors:         0,
+						SetErrors:         failedOps,
+						GetLatencyP50:     0, // GET latencies not applicable
+						GetLatencyP95:     0,
+						GetLatencyP99:     0,
+						GetLatencyMax:     0,
+						SetLatencyP50:     p50, // Use performance stats for SET latencies
+						SetLatencyP95:     p95,
+						SetLatencyP99:     p99,
+						SetLatencyMax:     stats.PerfStats.Histogram.Max(),
+						NetworkRxMBps:     sysStats.NetworkRxMBps,
+						NetworkTxMBps:     sysStats.NetworkTxMBps,
+						NetworkRxPPS:      sysStats.NetworkRxPPS,
+						NetworkTxPPS:      sysStats.NetworkTxPPS,
+						MemoryUsedGB:      sysStats.MemoryUsedMB / 1024,
+						MemoryTotalGB:     sysStats.MemoryTotalMB / 1024,
+						CPUPercent:        sysStats.CPUPercent,
+						ProcessMemoryGB:   procMemMB / 1024,
+						TotalOutBoundConn: sysStats.OutboundTCPConns,
 					}
 					stats.CSVLogger.LogMetrics(snapshot)
 				}

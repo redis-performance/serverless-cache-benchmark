@@ -4,6 +4,7 @@ Copyright © 2025 Redis Performance Group  <performance <at> redis <dot> com>
 package cmd
 
 import (
+	"bufio"
 	"context"
 	"encoding/csv"
 	"fmt"
@@ -23,6 +24,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/spf13/cobra"
 	"golang.org/x/time/rate"
 )
@@ -131,6 +136,7 @@ type MetricsSnapshot struct {
 	MemoryTotalGB     float64
 	CPUPercent        float64
 	ProcessMemoryGB   float64
+	TotalOutBoundConn int
 }
 
 // WorkloadStats tracks workload performance metrics
@@ -150,6 +156,15 @@ type WorkloadStats struct {
 	CSVLogger         *CSVLogger        // CSV output logger
 }
 
+// CloudWatchConfig holds CloudWatch configuration
+type CloudWatchConfig struct {
+	Enabled   bool
+	Region    string
+	Namespace string
+	Client    *cloudwatch.Client
+	Hostname  string
+}
+
 func NewWorkloadStats() *WorkloadStats {
 	return &WorkloadStats{
 		GetStats:   NewPerformanceStats(),
@@ -157,6 +172,169 @@ func NewWorkloadStats() *WorkloadStats {
 		SetupStats: NewPerformanceStats(),
 		TimeBlocks: make([]TimeBlockStats, 0),
 	}
+}
+
+// NewCloudWatchConfig creates a new CloudWatch configuration
+func NewCloudWatchConfig(enabled bool, region, namespace string) (*CloudWatchConfig, error) {
+	cwConfig := &CloudWatchConfig{
+		Enabled:   enabled,
+		Region:    region,
+		Namespace: namespace,
+	}
+
+	if !enabled {
+		return cwConfig, nil
+	}
+
+	// Get hostname
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+		log.Printf("Warning: Failed to get hostname: %v", err)
+	}
+	cwConfig.Hostname = hostname
+
+	// Load AWS config
+	awsCfg, err := config.LoadDefaultConfig(context.TODO(),
+		config.WithRegion(region),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
+	}
+
+	// Create CloudWatch client
+	cwConfig.Client = cloudwatch.NewFromConfig(awsCfg)
+
+	return cwConfig, nil
+}
+
+// emitCloudWatchMetrics emits metrics to CloudWatch
+func (cw *CloudWatchConfig) emitCloudWatchMetrics(getOps, setOps, totalQPS float64, getP99, setP99 int64, tcpConnCount int) {
+	if !cw.Enabled || cw.Client == nil {
+		return
+	}
+
+	// Create metric data
+	now := time.Now()
+	metricData := []types.MetricDatum{
+		{
+			MetricName: aws.String("GetOpsPerSecond"),
+			Value:      aws.Float64(getOps),
+			Unit:       types.StandardUnitCountSecond,
+			Dimensions: []types.Dimension{
+				{
+					Name:  aws.String("Host"),
+					Value: aws.String(cw.Hostname),
+				},
+				{
+					Name:  aws.String("LoadTest"),
+					Value: aws.String("MomentoPerf"),
+				},
+			},
+			Timestamp:         &now,
+			StorageResolution: aws.Int32(1),
+		},
+		{
+			MetricName: aws.String("SetOpsPerSecond"),
+			Value:      aws.Float64(setOps),
+			Unit:       types.StandardUnitCountSecond,
+			Dimensions: []types.Dimension{
+				{
+					Name:  aws.String("Host"),
+					Value: aws.String(cw.Hostname),
+				},
+				{
+					Name:  aws.String("LoadTest"),
+					Value: aws.String("MomentoPerf"),
+				},
+			},
+			Timestamp:         &now,
+			StorageResolution: aws.Int32(1),
+		},
+		{
+			MetricName: aws.String("TotalQPS"),
+			Value:      aws.Float64(totalQPS),
+			Unit:       types.StandardUnitCountSecond,
+			Dimensions: []types.Dimension{
+				{
+					Name:  aws.String("Host"),
+					Value: aws.String(cw.Hostname),
+				},
+				{
+					Name:  aws.String("LoadTest"),
+					Value: aws.String("MomentoPerf"),
+				},
+			},
+			Timestamp:         &now,
+			StorageResolution: aws.Int32(1),
+		},
+		{
+			MetricName: aws.String("GetLatencyP99"),
+			Value:      aws.Float64(float64(getP99)),
+			Unit:       types.StandardUnitMicroseconds,
+			Dimensions: []types.Dimension{
+				{
+					Name:  aws.String("Host"),
+					Value: aws.String(cw.Hostname),
+				},
+				{
+					Name:  aws.String("LoadTest"),
+					Value: aws.String("MomentoPerf"),
+				},
+			},
+			Timestamp:         &now,
+			StorageResolution: aws.Int32(1),
+		},
+		{
+			MetricName: aws.String("SetLatencyP99"),
+			Value:      aws.Float64(float64(setP99)),
+			Unit:       types.StandardUnitMicroseconds,
+			Dimensions: []types.Dimension{
+				{
+					Name:  aws.String("Host"),
+					Value: aws.String(cw.Hostname),
+				},
+				{
+					Name:  aws.String("LoadTest"),
+					Value: aws.String("MomentoPerf"),
+				},
+			},
+			Timestamp:         &now,
+			StorageResolution: aws.Int32(1),
+		},
+		{
+			MetricName: aws.String("TcpConnections"),
+			Value:      aws.Float64(float64(tcpConnCount)),
+			Unit:       types.StandardUnitCount,
+			Dimensions: []types.Dimension{
+				{
+					Name:  aws.String("Host"),
+					Value: aws.String(cw.Hostname),
+				},
+				{
+					Name:  aws.String("LoadTest"),
+					Value: aws.String("MomentoPerf"),
+				},
+			},
+			Timestamp:         &now,
+			StorageResolution: aws.Int32(1),
+		},
+	}
+
+	// Emit metrics asynchronously
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		_, err := cw.Client.PutMetricData(ctx, &cloudwatch.PutMetricDataInput{
+			Namespace:  aws.String(cw.Namespace),
+			MetricData: metricData,
+		})
+
+		if err != nil {
+			log.Printf("Warning: Failed to emit CloudWatch metrics: %v", err)
+		}
+	}()
 }
 
 // NewCSVLogger creates a new CSV logger with the specified filename
@@ -181,6 +359,7 @@ func NewCSVLogger(filename string) (*CSVLogger, error) {
 		"set_latency_p50_us", "set_latency_p95_us", "set_latency_p99_us", "set_latency_max_us",
 		"network_rx_mbps", "network_tx_mbps", "network_rx_pps", "network_tx_pps",
 		"memory_used_gb", "memory_total_gb", "cpu_percent", "process_memory_gb",
+		"total_out_bound_conn",
 	}
 
 	if err := writer.Write(header); err != nil {
@@ -233,6 +412,7 @@ func (cl *CSVLogger) LogMetrics(snapshot MetricsSnapshot) error {
 		fmt.Sprintf("%.2f", snapshot.MemoryTotalGB),
 		fmt.Sprintf("%.1f", snapshot.CPUPercent),
 		fmt.Sprintf("%.3f", snapshot.ProcessMemoryGB),
+		fmt.Sprintf("%d", snapshot.TotalOutBoundConn),
 	}
 
 	if err := cl.writer.Write(record); err != nil {
@@ -366,13 +546,14 @@ func parseRatio(ratioStr string) (int, int, error) {
 
 // SystemStats holds lightweight system monitoring data
 type SystemStats struct {
-	MemoryUsedMB  float64
-	MemoryTotalMB float64
-	CPUPercent    float64
-	NetworkRxMBps float64 // Network receive MB/s
-	NetworkTxMBps float64 // Network transmit MB/s
-	NetworkRxPPS  float64 // Network receive packets/s
-	NetworkTxPPS  float64 // Network transmit packets/s
+	MemoryUsedMB     float64
+	MemoryTotalMB    float64
+	CPUPercent       float64
+	NetworkRxMBps    float64 // Network receive MB/s
+	NetworkTxMBps    float64 // Network transmit MB/s
+	NetworkRxPPS     float64 // Network receive packets/s
+	NetworkTxPPS     float64 // Network transmit packets/s
+	OutboundTCPConns int     // Established outbound conn count
 }
 
 // NetworkStats holds network interface statistics
@@ -443,7 +624,49 @@ func getSystemStats() SystemStats {
 		stats.NetworkTxPPS = netStats.NetworkTxPPS
 	}
 
+	//Get established TCP Conn Count
+	files := []string{"/proc/self/net/tcp", "/proc/self/net/tcp6"}
+	totalOutboundConns := 0
+	for _, path := range files {
+		f, err := os.Open(path)
+		if err == nil {
+			sc := bufio.NewScanner(f)
+			if !sc.Scan() { // skip header
+				f.Close()
+				continue
+			}
+			for sc.Scan() {
+				fields := fastSplit(sc.Text())
+				if len(fields) >= 4 && fields[3] == "01" { // ESTABLISHED
+					totalOutboundConns++
+				}
+			}
+			f.Close()
+		}
+	}
+	stats.OutboundTCPConns = totalOutboundConns
+
 	return stats
+}
+
+func fastSplit(s string) []string {
+	res := make([]string, 0, 16)
+	start := -1
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c != ' ' && c != '\t' {
+			if start < 0 {
+				start = i
+			}
+		} else if start >= 0 {
+			res = append(res, s[start:i])
+			start = -1
+		}
+	}
+	if start >= 0 {
+		res = append(res, s[start:])
+	}
+	return res
 }
 
 // getNetworkStats returns network bandwidth and PPS statistics
@@ -635,11 +858,11 @@ func parseTrafficPattern(filename string) ([]TrafficConfig, error) {
 }
 
 // createAndTestCacheClient creates a cache client and measures setup time including ping
-func createAndTestCacheClient(cacheType string, cmd *cobra.Command, stats *WorkloadStats) (CacheClient, error) {
+func createAndTestCacheClient(ctx context.Context, cacheType string, cmd *cobra.Command, stats *WorkloadStats) (CacheClient, error) {
 	setupStart := time.Now()
 
 	// Create the client
-	client, err := createCacheClientForRun(cacheType, cmd)
+	client, err := createCacheClientForRun(ctx, cacheType, cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -665,7 +888,7 @@ func createAndTestCacheClient(cacheType string, cmd *cobra.Command, stats *Workl
 }
 
 // createCacheClientForRun creates a cache client for the run command (reuses populate logic)
-func createCacheClientForRun(cacheType string, cmd *cobra.Command) (CacheClient, error) {
+func createCacheClientForRun(ctx context.Context, cacheType string, cmd *cobra.Command) (CacheClient, error) {
 	switch cacheType {
 	case "redis":
 		uri, _ := cmd.Flags().GetString("redis-uri")
@@ -703,8 +926,10 @@ func createCacheClientForRun(cacheType string, cmd *cobra.Command) (CacheClient,
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
 		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
 		defaultTTL, _ := cmd.Flags().GetInt("default-ttl")
+		clientConnCount, _ := cmd.Flags().GetUint32("momento-client-conn-count")
+
 		// Don't create cache per worker - it should be created once upfront
-		client, err := NewMomentoClient(apiKey, cacheName, false, defaultTTL)
+		client, err := NewMomentoClient(ctx, apiKey, cacheName, false, defaultTTL, clientConnCount)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create Momento client: %w", err)
 		}
@@ -854,6 +1079,11 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	randomData, _ := cmd.Flags().GetBool("random-data")
 	defaultTTL, _ := cmd.Flags().GetInt("default-ttl")
 
+	// CloudWatch parameters
+	cloudwatchEnabled, _ := cmd.Flags().GetBool("cloudwatch-enabled")
+	cloudwatchRegion, _ := cmd.Flags().GetString("cloudwatch-region")
+	cloudwatchNamespace, _ := cmd.Flags().GetString("cloudwatch-namespace")
+
 	// Parse and validate parameters
 	setRatio, getRatio, err := parseRatio(ratioStr)
 	if err != nil {
@@ -899,15 +1129,28 @@ func runWorkload(cmd *cobra.Command, args []string) {
 
 	fmt.Printf("Logging metrics to: %s\n", csvOutput)
 
+	// Initialize CloudWatch configuration
+	cloudwatchConfig, err := NewCloudWatchConfig(cloudwatchEnabled, cloudwatchRegion, cloudwatchNamespace)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize CloudWatch: %v", err)
+		cloudwatchConfig = &CloudWatchConfig{Enabled: false}
+	} else if cloudwatchEnabled {
+		fmt.Printf("CloudWatch metrics enabled: region=%s, namespace=%s, host=%s\n",
+			cloudwatchRegion, cloudwatchNamespace, cloudwatchConfig.Hostname)
+	}
+
+	workerCount, _ := cmd.Flags().GetInt("momento-client-worker-count")
+
 	// For Momento, create cache once upfront to avoid spam
 	if cacheType == "momento" {
 		apiKey, _ := cmd.Flags().GetString("momento-api-key")
 		cacheName, _ := cmd.Flags().GetString("momento-cache-name")
 		createCache, _ := cmd.Flags().GetBool("momento-create-cache")
+		clientConnCount, _ := cmd.Flags().GetUint32("momento-client-conn-count")
 
 		if createCache {
 			// Create a temporary client just to create the cache
-			tempClient, err := NewMomentoClient(apiKey, cacheName, true, defaultTTL)
+			tempClient, err := NewMomentoClient(context.Background(), apiKey, cacheName, true, defaultTTL, clientConnCount)
 			if err != nil {
 				log.Fatalf("Failed to create Momento cache: %v", err)
 			}
@@ -933,18 +1176,18 @@ func runWorkload(cmd *cobra.Command, args []string) {
 	if trafficPatternFile != "" {
 		// Use dynamic traffic pattern
 		runDynamicWorkload(cmd, trafficPatternFile, cacheType, zipfExp, ratioStr, keyPrefix, keyMin,
-			totalKeys, dataSize, randomData, defaultTTL, measureSetup, verbose, quiet, timeoutSeconds, stats)
+			totalKeys, dataSize, randomData, defaultTTL, workerCount, measureSetup, verbose, quiet, timeoutSeconds, stats)
 	} else {
 		// Use static configuration - run the original logic
 		runStaticWorkload(cmd, cacheType, clientCount, rps, zipfExp, ratioStr, keyPrefix, keyMin,
-			totalKeys, dataSize, randomData, defaultTTL, measureSetup, verbose, quiet, timeoutSeconds, testTime, stats)
+			totalKeys, dataSize, randomData, defaultTTL, workerCount, measureSetup, verbose, quiet, timeoutSeconds, testTime, stats, cloudwatchConfig)
 	}
 }
 
 // runStaticWorkload runs the original static workload logic
 func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps int, zipfExp float64,
-	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData bool, defaultTTL int, measureSetup, verbose, quiet bool,
-	timeoutSeconds, testTime int, stats *WorkloadStats) {
+	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData bool, defaultTTL int, workerCount int, measureSetup, verbose, quiet bool,
+	timeoutSeconds, testTime int, stats *WorkloadStats, cloudwatchConfig *CloudWatchConfig) {
 
 	connectionDelayMs, _ := cmd.Flags().GetInt("connection-delay-ms")
 
@@ -999,9 +1242,16 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 		}
 
 		// Let each worker create its own connection in parallel
-		go runWorkerWithConnectionCreation(ctx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
-			generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
-			timeoutSeconds, measureSetup, verbose, quiet)
+		switch cacheType {
+		case "momento":
+			go runMomentoWorkerWithConnectionCreation(ctx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
+				generator, stats, workerCount, setRatio, getRatio, keyPrefix, keyMin, limiter,
+				timeoutSeconds, measureSetup, verbose, quiet)
+		default:
+			go runWorkerWithConnectionCreation(ctx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
+				generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
+				timeoutSeconds, measureSetup, verbose, quiet)
+		}
 	}
 
 	totalSetupTime := time.Since(setupStart)
@@ -1012,7 +1262,7 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 	}
 
 	// Start progress reporting
-	go reportStaticProgress(ctx, stats, testTime, clientCount, verbose)
+	go reportStaticProgress(ctx, stats, testTime, clientCount, verbose, cloudwatchConfig)
 
 	// Wait for all workers to complete
 	wg.Wait()
@@ -1024,7 +1274,7 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 
 // runDynamicWorkload runs workload with dynamic traffic patterns
 func runDynamicWorkload(cmd *cobra.Command, trafficPatternFile, cacheType string, zipfExp float64,
-	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData bool, defaultTTL int, measureSetup, verbose, quiet bool,
+	ratioStr, keyPrefix string, keyMin, totalKeys, dataSize int, randomData bool, defaultTTL int, workerCount int, measureSetup, verbose, quiet bool,
 	timeoutSeconds int, stats *WorkloadStats) {
 
 	// Parse traffic pattern
@@ -1081,7 +1331,7 @@ func runDynamicWorkload(cmd *cobra.Command, trafficPatternFile, cacheType string
 
 	// Start traffic pattern manager
 	go manageTrafficPattern(ctx, trafficConfigs, cacheType, cmd, generator, stats,
-		setRatio, getRatio, keyPrefix, keyMin, totalKeys, zipfExp, measureSetup, verbose, quiet, timeoutSeconds)
+		setRatio, getRatio, keyPrefix, workerCount, keyMin, totalKeys, zipfExp, measureSetup, verbose, quiet, timeoutSeconds)
 
 	// Start progress reporting
 	go reportProgress(ctx, stats, verbose)
@@ -1187,6 +1437,178 @@ func runWorkerInternal(ctx context.Context, workerID int, client CacheClient,
 	}
 }
 
+// runMomentoWorkerInternal contains the actual worker logic without WaitGroup management
+func runMomentoWorkerInternal(ctx context.Context, workerID int, client CacheClient,
+	totalKeys int, zipfExp float64, generator *DataGenerator, stats *WorkloadStats,
+	setRatio, getRatio int, keyPrefix string, workerCount int, keyMin int,
+	limiter *rate.Limiter, timeoutSeconds int, verbose bool) {
+
+	// Create a worker-specific Zipf generator with unique seed to ensure different key patterns
+	seed := time.Now().UnixNano() + int64(workerID*1000)
+	if verbose {
+		fmt.Printf("Worker %d: Creating Zipf generator with totalKeys=%d, zipfExp=%f, seed=%d\n",
+			workerID, totalKeys, zipfExp, seed)
+	}
+	zipfGen := NewZipfGenerator(uint64(totalKeys), zipfExp, seed)
+
+	totalRatio := setRatio + getRatio
+	if totalRatio == 0 {
+		return // Nothing to do
+	}
+
+	var opCount int64
+	if verbose {
+		fmt.Printf("Worker %d: Using producer-consumer batching with %d consumers\n", workerID, workerCount)
+	}
+
+	// Use producer-consumer model for continuous request processing
+	runProducerConsumer(ctx, workerID, client, totalKeys, zipfExp, generator, stats,
+		setRatio, getRatio, keyPrefix, keyMin, timeoutSeconds, workerCount, &opCount, zipfGen, verbose, limiter)
+}
+
+// runProducerConsumer implements producer-consumer model for continuous request processing
+func runProducerConsumer(ctx context.Context, workerID int, client CacheClient,
+	totalKeys int, zipfExp float64, generator *DataGenerator, stats *WorkloadStats,
+	setRatio, getRatio int, keyPrefix string, keyMin int, timeoutSeconds int, numConsumers int,
+	opCount *int64, zipfGen *ZipfGenerator, verbose bool, limiter *rate.Limiter) {
+
+	// Create channels for producer-consumer communication
+	requestChan := make(chan requestInfo, numConsumers*2) // Buffer to prevent blocking
+
+	// Start consumer goroutines
+	var consumerWG sync.WaitGroup
+	for i := 0; i < numConsumers; i++ {
+		consumerWG.Add(1)
+		go func(consumerID int) {
+			defer consumerWG.Done()
+			for request := range requestChan {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					result := processRequest(ctx, request, client, generator, timeoutSeconds, verbose)
+					// Process and record result
+					if result.isSet {
+						if result.isError {
+							atomic.AddInt64(&stats.SetErrors, 1)
+							stats.RecordOperationInBlock(true, 0, true)
+						} else {
+							atomic.AddInt64(&stats.SetOps, 1)
+							stats.SetStats.RecordLatency(result.latencyMicros)
+							stats.RecordOperationInBlock(true, result.latencyMicros, false)
+						}
+					} else {
+						if result.isError {
+							atomic.AddInt64(&stats.GetErrors, 1)
+							stats.RecordOperationInBlock(false, 0, true)
+						} else {
+							atomic.AddInt64(&stats.GetOps, 1)
+							stats.GetStats.RecordLatency(result.latencyMicros)
+							stats.RecordOperationInBlock(false, result.latencyMicros, false)
+						}
+					}
+				}
+			}
+		}(i)
+	}
+
+	// Producer loop - generate requests continuously
+	for {
+		// Apply rate limiting if configured
+		if limiter != nil {
+			err := limiter.Wait(ctx)
+			if err != nil {
+				close(requestChan)
+				consumerWG.Wait()
+				return
+			}
+		}
+
+		// Generate request info
+		*opCount++
+		isSet := (*opCount % int64(setRatio+getRatio)) < int64(setRatio)
+		keyOffset := zipfGen.Next()
+		key := fmt.Sprintf("%s%d", keyPrefix, keyMin+int(keyOffset))
+
+		request := requestInfo{
+			workerID: workerID,
+			isSet:    isSet,
+			key:      key,
+		}
+
+		// Send request to consumers (blocking if full)
+		select {
+		case requestChan <- request:
+		case <-ctx.Done():
+			close(requestChan)
+			consumerWG.Wait()
+			return
+		}
+	}
+}
+
+// requestInfo holds information for a single cache operation request
+type requestInfo struct {
+	workerID int
+	isSet    bool
+	key      string
+}
+
+// processRequest processes a single cache request
+func processRequest(ctx context.Context, request requestInfo, client CacheClient,
+	generator *DataGenerator, timeoutSeconds int, verbose bool) workloadResult {
+	// Create operation timeout context before timing
+	opCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+
+	if request.isSet {
+		// Generate data BEFORE timing the operation
+		data, err := generator.GenerateData()
+		if err != nil {
+			return workloadResult{isSet: true, isError: true, latencyMicros: 0}
+		}
+
+		// Get expiration from generator (uses DefaultTTL if set)
+		expiration := generator.GetExpiration()
+
+		// Time ONLY the cache operation
+		start := time.Now()
+		err = client.Set(opCtx, request.key, data, expiration)
+		latency := time.Since(start)
+
+		if err != nil {
+			if verbose {
+				log.Printf("Worker %d: Set operation failed for key %s: %v", request.workerID, request.key, err)
+			}
+			return workloadResult{isSet: true, isError: true, latencyMicros: 0}
+		} else {
+			return workloadResult{isSet: true, isError: false, latencyMicros: latency.Microseconds()}
+		}
+	} else {
+		// Perform GET operation
+		// Time ONLY the cache operation
+		start := time.Now()
+		_, err := client.Get(opCtx, request.key)
+		latency := time.Since(start)
+
+		if err != nil {
+			if verbose {
+				log.Printf("Worker %d: Get operation failed for key %s: %v", request.workerID, request.key, err)
+			}
+			return workloadResult{isSet: false, isError: true, latencyMicros: 0}
+		} else {
+			return workloadResult{isSet: false, isError: false, latencyMicros: latency.Microseconds()}
+		}
+	}
+}
+
+// workloadResult represents the result of a single request operation
+type workloadResult struct {
+	isSet         bool
+	isError       bool
+	latencyMicros int64
+}
+
 // runWorkerWithConnectionCreation creates its own connection and then runs the worker
 func runWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, workerID int,
 	cacheType string, cmd *cobra.Command, totalKeys int, zipfExp float64,
@@ -1201,9 +1623,9 @@ func runWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, wo
 	var err error
 
 	if measureSetup {
-		client, err = createAndTestCacheClient(cacheType, cmd, stats)
+		client, err = createAndTestCacheClient(ctx, cacheType, cmd, stats)
 	} else {
-		client, err = createCacheClientForRun(cacheType, cmd)
+		client, err = createCacheClientForRun(ctx, cacheType, cmd)
 	}
 
 	if err != nil {
@@ -1212,6 +1634,7 @@ func runWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, wo
 		atomic.AddInt64(&stats.FailedConnections, 1)
 		return
 	}
+	defer client.Close()
 
 	// Track successful connection
 	atomic.AddInt64(&stats.ActiveConnections, 1)
@@ -1226,10 +1649,40 @@ func runWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, wo
 		setRatio, getRatio, keyPrefix, keyMin, limiter, timeoutSeconds, verbose)
 }
 
+// runMomentoWorkerWithConnectionCreation creates its own connection and then runs the worker
+func runMomentoWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, workerID int,
+	cacheType string, cmd *cobra.Command, totalKeys int, zipfExp float64,
+	generator *DataGenerator, stats *WorkloadStats, workerCount int, setRatio, getRatio int,
+	keyPrefix string, keyMin int, limiter *rate.Limiter, timeoutSeconds int,
+	measureSetup, verbose, quiet bool) {
+
+	defer wg.Done()
+
+	// Create cache client in this goroutine (parallel connection creation)
+
+	// No need for measureSetup ping, just create the cache client as
+	// eager connection already occurs under the hood.
+	client, err := createCacheClientForRun(ctx, cacheType, cmd)
+	if err != nil {
+		// Always log connection failures as they're critical
+		log.Printf("Worker %d: Failed to create client: %v", workerID, err)
+		return
+	}
+
+	if verbose && !quiet {
+		clientConnCount, _ := cmd.Flags().GetUint32("momento-client-conn-count")
+		log.Printf("Worker %d: Successfully created Momento client with %d TCP connections", workerID, clientConnCount)
+	}
+
+	// Now run the normal worker routine (but don't call wg.Done() again)
+	runMomentoWorkerInternal(ctx, workerID, client, totalKeys, zipfExp, generator, stats,
+		setRatio, getRatio, keyPrefix, workerCount, keyMin, limiter, timeoutSeconds, verbose)
+}
+
 // manageTrafficPattern manages dynamic client scaling and QPS changes
 func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheType string,
 	cmd *cobra.Command, generator *DataGenerator, stats *WorkloadStats,
-	setRatio, getRatio int, keyPrefix string, keyMin, totalKeys int, zipfExp float64,
+	setRatio, getRatio int, keyPrefix string, workerCount int, keyMin, totalKeys int, zipfExp float64,
 	measureSetup, verbose, quiet bool, timeoutSeconds int) {
 	connectionDelayMs, _ := cmd.Flags().GetInt("connection-delay-ms")
 	var activeWorkers []context.CancelFunc
@@ -1305,13 +1758,20 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 				if connectionDelayMs > 0 {
 					time.Sleep(time.Duration(connectionDelayMs) * time.Millisecond)
 				}
-
-				// Pass connection creation parameters to worker - let it create connection in parallel
-				go runWorkerWithConnectionCreation(workerCtx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
-					generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
-					timeoutSeconds, measureSetup, verbose, quiet)
+				switch cacheType {
+				case "redis":
+					// Pass connection creation parameters to worker - let it create connection in parallel
+					go runWorkerWithConnectionCreation(workerCtx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
+						generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
+						timeoutSeconds, measureSetup, verbose, quiet)
+				case "momento":
+					go runMomentoWorkerWithConnectionCreation(workerCtx, &wg, i, cacheType, cmd, totalKeys, zipfExp,
+						generator, stats, workerCount, setRatio, getRatio, keyPrefix, keyMin, limiter,
+						timeoutSeconds, measureSetup, verbose, quiet)
+				default:
+					log.Fatalf("Invalid cache type: %s", cacheType)
+				}
 			}
-
 			fmt.Printf("  Successfully initiated %d new workers\n", newWorkers)
 		}
 	}
@@ -1330,7 +1790,7 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 
 // reportProgress reports workload progress with a progress bar
 func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(MetricWindowSizeSeconds * time.Second)
 	defer ticker.Stop()
 
 	startTime := time.Now()
@@ -1351,10 +1811,6 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 			elapsed := time.Since(startTime)
 
 			if totalOps > 0 {
-				getQPS := float64(getOps) / elapsed.Seconds()
-				setQPS := float64(setOps) / elapsed.Seconds()
-				totalQPS := getQPS + setQPS
-
 				// Create progress bar
 				progressBar := createProgressBar(elapsed, stats)
 
@@ -1362,9 +1818,14 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 				currentClients := getCurrentClientCount(stats)
 				targetClients, targetQPS := getCurrentTargetInfo(stats)
 
-				// Collect latency metrics
-				_, _, _, _, getP50, getP95, getP99 := stats.GetStats.GetStats()
-				_, _, _, _, setP50, setP95, setP99 := stats.SetStats.GetStats()
+				// Get current second stats for progress bar display
+				getCurrentOps, getP50, getP95, getP99, getMax := stats.GetStats.GetPreviousWindowStats()
+				setCurrentOps, setP50, setP95, setP99, setMax := stats.SetStats.GetPreviousWindowStats()
+
+				// Calculate current metric window AVG QPS
+				currentWindowGetOps := float64(getCurrentOps / MetricWindowSizeSeconds)
+				currentWindowSetOps := float64(setCurrentOps / MetricWindowSizeSeconds)
+				currentTotalQPS := currentWindowGetOps + currentWindowSetOps
 
 				// Get system resource usage
 				sysStats := getSystemStats()
@@ -1383,9 +1844,9 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 						ActualClients:     int(activeConns),
 						FailedConnections: failedConns,
 						TargetQPS:         targetQPS,
-						ActualTotalQPS:    totalQPS,
-						ActualGetQPS:      getQPS,
-						ActualSetQPS:      setQPS,
+						ActualTotalQPS:    currentTotalQPS,
+						ActualGetQPS:      currentWindowGetOps,
+						ActualSetQPS:      currentWindowSetOps,
 						TotalOps:          totalOps,
 						GetOps:            getOps,
 						SetOps:            setOps,
@@ -1394,11 +1855,11 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 						GetLatencyP50:     getP50,
 						GetLatencyP95:     getP95,
 						GetLatencyP99:     getP99,
-						GetLatencyMax:     stats.GetStats.Histogram.Max(),
+						GetLatencyMax:     getMax,
 						SetLatencyP50:     setP50,
 						SetLatencyP95:     setP95,
 						SetLatencyP99:     setP99,
-						SetLatencyMax:     stats.SetStats.Histogram.Max(),
+						SetLatencyMax:     setMax,
 						NetworkRxMBps:     sysStats.NetworkRxMBps,
 						NetworkTxMBps:     sysStats.NetworkTxMBps,
 						NetworkRxPPS:      sysStats.NetworkRxPPS,
@@ -1407,19 +1868,46 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 						MemoryTotalGB:     sysStats.MemoryTotalMB / 1024,
 						CPUPercent:        sysStats.CPUPercent,
 						ProcessMemoryGB:   procMemMB / 1024,
+						TotalOutBoundConn: sysStats.OutboundTCPConns,
 					}
 					stats.CSVLogger.LogMetrics(snapshot)
 				}
 
-				// Get connection stats
 				activeConns := atomic.LoadInt64(&stats.ActiveConnections)
 				failedConns := atomic.LoadInt64(&stats.FailedConnections)
-
-				// Format the progress line with resource monitoring and connection info
-				progressLine := fmt.Sprintf("\r%s | %d clients | %.0f ops/s | GET: %.0f/s | SET: %.0f/s | Conns: %d/%d | Mem: %.1fGB/%.1fGB | CPU: %.0f%% | Net: %.1f/%.1f MB/s",
-					progressBar, currentClients, totalQPS, getQPS, setQPS, activeConns, failedConns,
+				// Format the progress line with resource monitoring
+				progressLine := fmt.Sprintf(
+					"\n%s\n"+
+						"Clients : %d\n"+
+						"\n"+
+						"Active conns : %d\tFailed conns : %d\n"+
+						"\n"+
+						"Throughput\n"+
+						"  Ops/s   : Overall: %.0f  |  GET: %.0f/s  |  SET: %.0f/s\n"+
+						"\n"+
+						"Latency\n"+
+						"  GET     : p50 %.2f ms | p99 %.2f ms\n"+
+						"  SET     : p50 %.2f ms | p99 %.2f ms\n"+
+						"\n"+
+						"System\n"+
+						"  Memory  : %.1fGB / %.1fGB\n"+
+						"  CPU     : %.0f%%\n"+
+						"  ProcMem : %.1fGB\n"+
+						"  Network : Rx %.1f MB/s | Tx %.1f MB/s\n"+
+						"  TotalOutBoundConn : %d",
+					progressBar,
+					currentClients,
+					activeConns,
+					failedConns,
+					currentTotalQPS, currentWindowGetOps, currentWindowSetOps,
+					float64(getP50)/1000.0, float64(getP99)/1000.0,
+					float64(setP50)/1000.0, float64(setP99)/1000.0,
 					sysStats.MemoryUsedMB/1024, sysStats.MemoryTotalMB/1024,
-					sysStats.CPUPercent, sysStats.NetworkRxMBps, sysStats.NetworkTxMBps)
+					sysStats.CPUPercent,
+					procMemMB/1024,
+					sysStats.NetworkRxMBps, sysStats.NetworkTxMBps,
+					sysStats.OutboundTCPConns,
+				)
 
 				// Truncate if too long for terminal
 				if len(progressLine) > 150 {
@@ -1496,8 +1984,8 @@ func getCurrentTargetInfo(stats *WorkloadStats) (int, int) {
 }
 
 // reportStaticProgress reports progress for static workload with progress bar
-func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime int, clientCount int, verbose bool) {
-	ticker := time.NewTicker(1 * time.Second)
+func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime int, clientCount int, verbose bool, cloudwatchConfig *CloudWatchConfig) {
+	ticker := time.NewTicker(MetricWindowSizeSeconds * time.Second)
 	defer ticker.Stop()
 
 	startTime := time.Now()
@@ -1507,7 +1995,7 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 		select {
 		case <-ctx.Done():
 			// Clear the progress line
-			fmt.Print("\r" + strings.Repeat(" ", 150) + "\r")
+			//fmt.Print("\r" + strings.Repeat(" ", 150) + "\r")
 			return
 		case <-ticker.C:
 			getOps := atomic.LoadInt64(&stats.GetOps)
@@ -1519,13 +2007,14 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 			elapsed := time.Since(startTime)
 
 			if totalOps > 0 {
-				getQPS := float64(getOps) / elapsed.Seconds()
-				setQPS := float64(setOps) / elapsed.Seconds()
-				totalQPS := getQPS + setQPS
+				// Get current monitoring window stats
+				getCurrentOps, getP50, getP95, getP99, getMax := stats.GetStats.GetPreviousWindowStats()
+				setCurrentOps, setP50, setP95, setP99, setMax := stats.SetStats.GetPreviousWindowStats()
 
-				// Collect latency metrics
-				_, _, _, _, getP50, getP95, getP99 := stats.GetStats.GetStats()
-				_, _, _, _, setP50, setP95, setP99 := stats.SetStats.GetStats()
+				// Calculate current metric window AVG QPS
+				currentWindowGetOps := float64(getCurrentOps / MetricWindowSizeSeconds)
+				currentWindowSetOps := float64(setCurrentOps / MetricWindowSizeSeconds)
+				currentTotalQPS := currentWindowGetOps + currentWindowSetOps
 
 				// Create progress bar for static workload
 				progressBar := createStaticProgressBar(elapsed, totalDuration)
@@ -1547,9 +2036,9 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 						ActualClients:     int(activeConns),
 						FailedConnections: failedConns,
 						TargetQPS:         -1, // Static workload doesn't have target QPS
-						ActualTotalQPS:    totalQPS,
-						ActualGetQPS:      getQPS,
-						ActualSetQPS:      setQPS,
+						ActualTotalQPS:    currentTotalQPS,
+						ActualGetQPS:      currentWindowGetOps,
+						ActualSetQPS:      currentWindowSetOps,
 						TotalOps:          totalOps,
 						GetOps:            getOps,
 						SetOps:            setOps,
@@ -1558,11 +2047,11 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 						GetLatencyP50:     getP50,
 						GetLatencyP95:     getP95,
 						GetLatencyP99:     getP99,
-						GetLatencyMax:     stats.GetStats.Histogram.Max(),
+						GetLatencyMax:     getMax,
 						SetLatencyP50:     setP50,
 						SetLatencyP95:     setP95,
 						SetLatencyP99:     setP99,
-						SetLatencyMax:     stats.SetStats.Histogram.Max(),
+						SetLatencyMax:     setMax,
 						NetworkRxMBps:     sysStats.NetworkRxMBps,
 						NetworkTxMBps:     sysStats.NetworkTxMBps,
 						NetworkRxPPS:      sysStats.NetworkRxPPS,
@@ -1571,22 +2060,44 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 						MemoryTotalGB:     sysStats.MemoryTotalMB / 1024,
 						CPUPercent:        sysStats.CPUPercent,
 						ProcessMemoryGB:   procMemMB / 1024,
+						TotalOutBoundConn: sysStats.OutboundTCPConns,
 					}
 					stats.CSVLogger.LogMetrics(snapshot)
 				}
 
-				// Format the progress line with resource monitoring
-				progressLine := fmt.Sprintf("\r%s | %d clients | %.0f ops/s | GET: %.0f/s | SET: %.0f/s | Mem: %.1fGB/%.1fGB | CPU: %.0f%% | Proc: %.1fGB | Net: %.1f/%.1f MB/s",
-					progressBar, clientCount, totalQPS, getQPS, setQPS,
+				progressLine := fmt.Sprintf(
+					"\n%s\n"+
+						"Clients : %d\n"+
+						"\n"+
+						"Throughput\n"+
+						"  Ops/s   : Overall: %.0f  |  GET: %.0f/s  |  SET: %.0f/s\n"+
+						"\n"+
+						"Latency\n"+
+						"  GET     : p50 %.2f ms | p99 %.2f ms\n"+
+						"  SET     : p50 %.2f ms | p99 %.2f ms\n"+
+						"\n"+
+						"System\n"+
+						"  Memory  : %.1fGB / %.1fGB\n"+
+						"  CPU     : %.0f%%\n"+
+						"  ProcMem : %.1fGB\n"+
+						"  Network : Rx %.1f MB/s | Tx %.1f MB/s\n"+
+						"  TotalOutBoundConn : %d",
+					progressBar,
+					clientCount,
+					currentTotalQPS, currentWindowGetOps, currentWindowSetOps,
+					float64(getP50)/1000.0, float64(getP99)/1000.0,
+					float64(setP50)/1000.0, float64(setP99)/1000.0,
 					sysStats.MemoryUsedMB/1024, sysStats.MemoryTotalMB/1024,
-					sysStats.CPUPercent, procMemMB/1024, sysStats.NetworkRxMBps, sysStats.NetworkTxMBps)
-
-				// Truncate if too long for terminal
-				if len(progressLine) > 150 {
-					progressLine = progressLine[:147] + "..."
-				}
+					sysStats.CPUPercent,
+					procMemMB/1024,
+					sysStats.NetworkRxMBps, sysStats.NetworkTxMBps,
+					sysStats.OutboundTCPConns,
+				)
 
 				fmt.Print(progressLine)
+
+				// Emit CloudWatch metrics
+				cloudwatchConfig.emitCloudWatchMetrics(currentWindowGetOps, currentWindowSetOps, currentTotalQPS, getP99, setP99, sysStats.OutboundTCPConns)
 			}
 		}
 	}
@@ -1594,7 +2105,7 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 
 // createStaticProgressBar creates a progress bar for static workload
 func createStaticProgressBar(elapsed, total time.Duration) string {
-	barWidth := 20
+	barWidth := 10
 	progress := float64(elapsed) / float64(total)
 	if progress > 1.0 {
 		progress = 1.0
@@ -1666,7 +2177,7 @@ func printFinalResults(stats *WorkloadStats, testTime int, measureSetup bool) {
 		_, _, _, _, getP50, getP95, getP99 := stats.GetStats.GetStats()
 
 		fmt.Printf("GET Operations: %d\n", getOps)
-		fmt.Printf("GET QPS: %.2f\n", getQPS)
+		fmt.Printf("AVG GET QPS: %.2f\n", getQPS)
 		fmt.Printf("GET Errors: %d (%.2f%%)\n", getErrors, float64(getErrors)/float64(getOps)*100)
 		fmt.Printf("GET Latency - P50: %d μs, P95: %d μs, P99: %d μs\n", getP50, getP95, getP99)
 		fmt.Println()
@@ -1678,7 +2189,7 @@ func printFinalResults(stats *WorkloadStats, testTime int, measureSetup bool) {
 		_, _, _, _, setP50, setP95, setP99 := stats.SetStats.GetStats()
 
 		fmt.Printf("SET Operations: %d\n", setOps)
-		fmt.Printf("SET QPS: %.2f\n", setQPS)
+		fmt.Printf("AVG SET QPS: %.2f\n", setQPS)
 		fmt.Printf("SET Errors: %d (%.2f%%)\n", setErrors, float64(setErrors)/float64(setOps)*100)
 		fmt.Printf("SET Latency - P50: %d μs, P95: %d μs, P99: %d μs\n", setP50, setP95, setP99)
 	}
@@ -1821,7 +2332,7 @@ func runConnectionSetupBenchmark(cmd *cobra.Command, args []string) {
 
 			// Measure connection setup time (create + ping)
 			connStart := time.Now()
-			client, err := createCacheClientForRun(cacheType, cmd)
+			client, err := createCacheClientForRun(ctx, cacheType, cmd)
 			if err != nil {
 				atomic.AddInt64(&failureCount, 1)
 				if verbose {
@@ -1832,10 +2343,11 @@ func runConnectionSetupBenchmark(cmd *cobra.Command, args []string) {
 			defer client.Close()
 
 			// Test connectivity with ping
-			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
-			defer cancel()
-
-			err = client.Ping(ctx)
+			// PING Already happens under hood when establishing client dont need to do a second time
+			//ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
+			//defer cancel()
+			//
+			//err = client.Ping(ctx)
 			setupTime := time.Since(connStart)
 
 			if err != nil {
@@ -2009,6 +2521,8 @@ func init() {
 	runCmd.Flags().Bool("momento-create-cache", true, "Automatically create Momento cache if it doesn't exist")
 	runCmd.Flags().Int("connection-timeout", 180, "Connection timeout in seconds for client creation and ping")
 	runCmd.Flags().Int("connection-delay-ms", 0, "Delay in milliseconds between worker connection attempts (helps with connection storms)")
+	runCmd.Flags().Uint32("momento-client-conn-count", 1, "Set number of TCP conn each momento client creates")
+	runCmd.Flags().Int("momento-client-worker-count", 1, "Set number of workload generators for each momento client")
 
 	// Workload-specific Options
 	runCmd.Flags().Float64("key-zipf-exp", 1.0, "Zipf distribution exponent (0 < exp <= 5), higher = more concentration")
@@ -2028,4 +2542,9 @@ func init() {
 	// Data Options
 	runCmd.Flags().IntP("data-size", "d", 32, "Object data size in bytes")
 	runCmd.Flags().BoolP("random-data", "R", false, "Use random data instead of pattern data")
+
+	// CloudWatch Options
+	runCmd.Flags().Bool("cloudwatch-enabled", true, "Enable CloudWatch metrics emission")
+	runCmd.Flags().String("cloudwatch-region", "us-east-2", "AWS region for CloudWatch metrics")
+	runCmd.Flags().String("cloudwatch-namespace", "MomentoBenchmark", "CloudWatch namespace for metrics")
 }
