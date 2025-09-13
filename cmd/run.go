@@ -29,6 +29,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/spf13/cobra"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/time/rate"
 )
 
@@ -136,7 +137,9 @@ type MetricsSnapshot struct {
 	MemoryTotalGB     float64
 	CPUPercent        float64
 	ProcessMemoryGB   float64
-	TotalOutBoundConn int
+	TotalOutBoundConn int // Legacy TCP connection count from /proc
+	ActiveTCPConns    int // Active TCP connections from netlink
+	TCPConnDelta      int // Change in TCP connections from previous second
 }
 
 // WorkloadStats tracks workload performance metrics
@@ -209,7 +212,7 @@ func NewCloudWatchConfig(enabled bool, region, namespace string) (*CloudWatchCon
 }
 
 // emitCloudWatchMetrics emits metrics to CloudWatch
-func (cw *CloudWatchConfig) emitCloudWatchMetrics(getOps, setOps, totalQPS float64, getP99, setP99 int64, tcpConnCount int) {
+func (cw *CloudWatchConfig) emitCloudWatchMetrics(getOps, setOps, totalQPS float64, getP99, setP99 int64, tcpConnCount, activeTcpConns, tcpConnDelta int) {
 	if !cw.Enabled || cw.Client == nil {
 		return
 	}
@@ -319,6 +322,40 @@ func (cw *CloudWatchConfig) emitCloudWatchMetrics(getOps, setOps, totalQPS float
 			Timestamp:         &now,
 			StorageResolution: aws.Int32(1),
 		},
+		{
+			MetricName: aws.String("ActiveTcpConnections"),
+			Value:      aws.Float64(float64(activeTcpConns)),
+			Unit:       types.StandardUnitCount,
+			Dimensions: []types.Dimension{
+				{
+					Name:  aws.String("Host"),
+					Value: aws.String(cw.Hostname),
+				},
+				{
+					Name:  aws.String("LoadTest"),
+					Value: aws.String("MomentoPerf"),
+				},
+			},
+			Timestamp:         &now,
+			StorageResolution: aws.Int32(1),
+		},
+		{
+			MetricName: aws.String("TcpConnectionDelta"),
+			Value:      aws.Float64(float64(tcpConnDelta)),
+			Unit:       types.StandardUnitCount,
+			Dimensions: []types.Dimension{
+				{
+					Name:  aws.String("Host"),
+					Value: aws.String(cw.Hostname),
+				},
+				{
+					Name:  aws.String("LoadTest"),
+					Value: aws.String("MomentoPerf"),
+				},
+			},
+			Timestamp:         &now,
+			StorageResolution: aws.Int32(1),
+		},
 	}
 
 	// Emit metrics asynchronously
@@ -359,7 +396,7 @@ func NewCSVLogger(filename string) (*CSVLogger, error) {
 		"set_latency_p50_us", "set_latency_p95_us", "set_latency_p99_us", "set_latency_max_us",
 		"network_rx_mbps", "network_tx_mbps", "network_rx_pps", "network_tx_pps",
 		"memory_used_gb", "memory_total_gb", "cpu_percent", "process_memory_gb",
-		"total_out_bound_conn",
+		"total_out_bound_conn", "active_tcp_conns", "tcp_conn_delta",
 	}
 
 	if err := writer.Write(header); err != nil {
@@ -413,6 +450,8 @@ func (cl *CSVLogger) LogMetrics(snapshot MetricsSnapshot) error {
 		fmt.Sprintf("%.1f", snapshot.CPUPercent),
 		fmt.Sprintf("%.3f", snapshot.ProcessMemoryGB),
 		fmt.Sprintf("%d", snapshot.TotalOutBoundConn),
+		fmt.Sprintf("%d", snapshot.ActiveTCPConns),
+		fmt.Sprintf("%d", snapshot.TCPConnDelta),
 	}
 
 	if err := cl.writer.Write(record); err != nil {
@@ -544,6 +583,45 @@ func parseRatio(ratioStr string) (int, int, error) {
 	return setRatio, getRatio, nil
 }
 
+// TCPMonitor tracks TCP connection counts over time
+type TCPMonitor struct {
+	mu             sync.RWMutex
+	currentCount   int
+	previousCount  int
+	history        []int
+	maxHistorySize int
+	lastUpdate     time.Time
+	redisPorts     []int // Redis ports to filter connections
+}
+
+// updateCount updates the TCP connection count and maintains history
+func (tm *TCPMonitor) updateCount(count int) {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	tm.previousCount = tm.currentCount
+	tm.currentCount = count
+	tm.lastUpdate = time.Now()
+
+	// Add to history and maintain max size
+	tm.history = append(tm.history, count)
+	if len(tm.history) > tm.maxHistorySize {
+		tm.history = tm.history[1:]
+	}
+}
+
+// getStats returns current TCP connection statistics
+func (tm *TCPMonitor) getStats() (current, delta int, history []int) {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	current = tm.currentCount
+	delta = tm.currentCount - tm.previousCount
+	history = make([]int, len(tm.history))
+	copy(history, tm.history)
+	return
+}
+
 // SystemStats holds lightweight system monitoring data
 type SystemStats struct {
 	MemoryUsedMB     float64
@@ -553,7 +631,10 @@ type SystemStats struct {
 	NetworkTxMBps    float64 // Network transmit MB/s
 	NetworkRxPPS     float64 // Network receive packets/s
 	NetworkTxPPS     float64 // Network transmit packets/s
-	OutboundTCPConns int     // Established outbound conn count
+	OutboundTCPConns int     // Established outbound conn count (from /proc)
+	ActiveTCPConns   int     // All active TCP connections (from netlink)
+	TCPConnDelta     int     // Change from previous second
+	TCPConnHistory   []int   // Last N seconds for trending
 }
 
 // NetworkStats holds network interface statistics
@@ -567,8 +648,150 @@ type NetworkStats struct {
 
 var lastNetworkStats *NetworkStats
 
+// startTCPMonitoring starts a goroutine that monitors TCP connections every second
+func startTCPMonitoring(ctx context.Context, monitor *TCPMonitor) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			count := getTCPConnectionCountFiltered(monitor.redisPorts)
+			monitor.updateCount(count)
+		}
+	}
+}
+
+// getTCPConnectionCount gets the count of all established TCP connections using netlink
+func getTCPConnectionCount() int {
+	// Try netlink first (more accurate)
+	socks, err := netlink.SocketDiagTCP(0)
+	if err != nil {
+		// Fallback to /proc parsing if netlink fails
+		return getCurrentTCPCountFromProc()
+	}
+
+	count := 0
+	for _, s := range socks {
+		if s.State == netlink.TCP_ESTABLISHED {
+			count++
+		}
+	}
+	return count
+}
+
+// getTCPConnectionCountFiltered gets the count of established TCP connections filtered by Redis ports
+func getTCPConnectionCountFiltered(redisPorts []int) int {
+	return getCurrentTCPCountFromProcFiltered(redisPorts)
+}
+
+// extractRedisPorts extracts Redis server ports from configuration for TCP filtering
+func extractRedisPorts(cmd *cobra.Command, cacheType string) []int {
+	var ports []int
+
+	if cacheType == "redis" {
+		redisURI, _ := cmd.Flags().GetString("redis-uri")
+		if redisURI != "" {
+			// Parse Redis URI to extract port
+			if strings.HasPrefix(redisURI, "redis://") || strings.HasPrefix(redisURI, "rediss://") {
+				// Remove protocol
+				uri := redisURI
+				if strings.HasPrefix(uri, "redis://") {
+					uri = uri[8:]
+				} else if strings.HasPrefix(uri, "rediss://") {
+					uri = uri[9:]
+				}
+
+				// Extract host:port part (before any path/query)
+				if idx := strings.Index(uri, "/"); idx != -1 {
+					uri = uri[:idx]
+				}
+				if idx := strings.Index(uri, "?"); idx != -1 {
+					uri = uri[:idx]
+				}
+
+				// Remove username:password@ if present
+				if idx := strings.LastIndex(uri, "@"); idx != -1 {
+					uri = uri[idx+1:]
+				}
+
+				// Extract port
+				if idx := strings.LastIndex(uri, ":"); idx != -1 {
+					if portStr := uri[idx+1:]; portStr != "" {
+						if port, err := strconv.Atoi(portStr); err == nil {
+							ports = append(ports, port)
+						}
+					}
+				} else {
+					// Default Redis port
+					ports = append(ports, 6379)
+				}
+			}
+		}
+	}
+	// For Momento, we don't filter by port since it uses HTTPS
+
+	return ports
+}
+
+// getCurrentTCPCountFromProc gets TCP connection count from /proc, filtering for Redis connections
+func getCurrentTCPCountFromProc() int {
+	return getCurrentTCPCountFromProcFiltered(nil)
+}
+
+// getCurrentTCPCountFromProcFiltered gets TCP connection count from /proc with optional port filtering
+func getCurrentTCPCountFromProcFiltered(redisPorts []int) int {
+	files := []string{"/proc/net/tcp", "/proc/net/tcp6"}
+	totalOutboundConns := 0
+
+	for _, path := range files {
+		f, err := os.Open(path)
+		if err == nil {
+			sc := bufio.NewScanner(f)
+			if !sc.Scan() { // skip header
+				f.Close()
+				continue
+			}
+			for sc.Scan() {
+				fields := fastSplit(sc.Text())
+				if len(fields) >= 4 && fields[3] == "01" { // ESTABLISHED
+					// If Redis ports are specified, filter by destination port
+					if redisPorts != nil && len(redisPorts) > 0 {
+						if len(fields) >= 3 {
+							// Parse remote address (format: IP:PORT in hex)
+							remoteAddr := fields[2]
+							if colonIdx := strings.LastIndex(remoteAddr, ":"); colonIdx != -1 {
+								portHex := remoteAddr[colonIdx+1:]
+								if port, err := strconv.ParseInt(portHex, 16, 32); err == nil {
+									isRedisPort := false
+									for _, redisPort := range redisPorts {
+										if int(port) == redisPort {
+											isRedisPort = true
+											break
+										}
+									}
+									if isRedisPort {
+										totalOutboundConns++
+									}
+								}
+							}
+						}
+					} else {
+						// No filtering, count all established connections
+						totalOutboundConns++
+					}
+				}
+			}
+			f.Close()
+		}
+	}
+	return totalOutboundConns
+}
+
 // getSystemStats returns current system resource usage (lightweight)
-func getSystemStats() SystemStats {
+func getSystemStats(tcpMonitor *TCPMonitor) SystemStats {
 	stats := SystemStats{}
 
 	// Get memory info from /proc/meminfo
@@ -624,27 +847,16 @@ func getSystemStats() SystemStats {
 		stats.NetworkTxPPS = netStats.NetworkTxPPS
 	}
 
-	//Get established TCP Conn Count
-	files := []string{"/proc/self/net/tcp", "/proc/self/net/tcp6"}
-	totalOutboundConns := 0
-	for _, path := range files {
-		f, err := os.Open(path)
-		if err == nil {
-			sc := bufio.NewScanner(f)
-			if !sc.Scan() { // skip header
-				f.Close()
-				continue
-			}
-			for sc.Scan() {
-				fields := fastSplit(sc.Text())
-				if len(fields) >= 4 && fields[3] == "01" { // ESTABLISHED
-					totalOutboundConns++
-				}
-			}
-			f.Close()
-		}
+	// Get enhanced TCP connection data from monitor if available
+	if tcpMonitor != nil {
+		current, delta, history := tcpMonitor.getStats()
+		stats.ActiveTCPConns = current
+		stats.TCPConnDelta = delta
+		stats.TCPConnHistory = history
 	}
-	stats.OutboundTCPConns = totalOutboundConns
+
+	// Get established TCP Conn Count (fallback/legacy method)
+	stats.OutboundTCPConns = getCurrentTCPCountFromProc()
 
 	return stats
 }
@@ -1210,6 +1422,10 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(testTime)*time.Second)
 	defer cancel()
 
+	// Create TCP monitor and start monitoring
+	tcpMonitor := &TCPMonitor{maxHistorySize: 10}
+	go startTCPMonitoring(ctx, tcpMonitor)
+
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -1270,7 +1486,7 @@ func runStaticWorkload(cmd *cobra.Command, cacheType string, clientCount, rps in
 	}
 
 	// Start progress reporting
-	go reportStaticProgress(ctx, stats, testTime, clientCount, verbose, cloudwatchConfig)
+	go reportStaticProgress(ctx, stats, testTime, clientCount, verbose, cloudwatchConfig, tcpMonitor)
 
 	// Wait for all workers to complete
 	wg.Wait()
@@ -1325,6 +1541,10 @@ func runDynamicWorkload(cmd *cobra.Command, trafficPatternFile, cacheType string
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(totalTestTime)*time.Second)
 	defer cancel()
 
+	// Create TCP monitor and start monitoring
+	tcpMonitor := &TCPMonitor{maxHistorySize: 10}
+	go startTCPMonitoring(ctx, tcpMonitor)
+
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -1342,7 +1562,7 @@ func runDynamicWorkload(cmd *cobra.Command, trafficPatternFile, cacheType string
 		setRatio, getRatio, keyPrefix, workerCount, keyMin, totalKeys, zipfExp, measureSetup, verbose, quiet, timeoutSeconds)
 
 	// Start progress reporting
-	go reportProgress(ctx, stats, verbose)
+	go reportProgress(ctx, stats, verbose, tcpMonitor)
 
 	// Wait for context to complete
 	<-ctx.Done()
@@ -1870,7 +2090,7 @@ func manageTrafficPattern(ctx context.Context, configs []TrafficConfig, cacheTyp
 }
 
 // reportProgress reports workload progress with a progress bar
-func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
+func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool, tcpMonitor *TCPMonitor) {
 	ticker := time.NewTicker(MetricWindowSizeSeconds * time.Second)
 	defer ticker.Stop()
 
@@ -1909,7 +2129,7 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 				currentTotalQPS := currentWindowGetOps + currentWindowSetOps
 
 				// Get system resource usage
-				sysStats := getSystemStats()
+				sysStats := getSystemStats(tcpMonitor)
 				procMemMB := getProcessMemoryMB()
 
 				// Create metrics snapshot and log to CSV
@@ -1950,6 +2170,8 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 						CPUPercent:        sysStats.CPUPercent,
 						ProcessMemoryGB:   procMemMB / 1024,
 						TotalOutBoundConn: sysStats.OutboundTCPConns,
+						ActiveTCPConns:    sysStats.ActiveTCPConns,
+						TCPConnDelta:      sysStats.TCPConnDelta,
 					}
 					stats.CSVLogger.LogMetrics(snapshot)
 				}
@@ -1975,7 +2197,7 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 						"  CPU     : %.0f%%\n"+
 						"  ProcMem : %.1fGB\n"+
 						"  Network : Rx %.1f MB/s | Tx %.1f MB/s\n"+
-						"  TotalOutBoundConn : %d",
+						"  TCP Conns: %d (Δ%+d) | OutBound: %d",
 					progressBar,
 					currentClients,
 					activeConns,
@@ -1987,7 +2209,7 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool) {
 					sysStats.CPUPercent,
 					procMemMB/1024,
 					sysStats.NetworkRxMBps, sysStats.NetworkTxMBps,
-					sysStats.OutboundTCPConns,
+					sysStats.ActiveTCPConns, sysStats.TCPConnDelta, sysStats.OutboundTCPConns,
 				)
 
 				// Truncate if too long for terminal
@@ -2065,7 +2287,7 @@ func getCurrentTargetInfo(stats *WorkloadStats) (int, int) {
 }
 
 // reportStaticProgress reports progress for static workload with progress bar
-func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime int, clientCount int, verbose bool, cloudwatchConfig *CloudWatchConfig) {
+func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime int, clientCount int, verbose bool, cloudwatchConfig *CloudWatchConfig, tcpMonitor *TCPMonitor) {
 	ticker := time.NewTicker(MetricWindowSizeSeconds * time.Second)
 	defer ticker.Stop()
 
@@ -2101,7 +2323,7 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 				progressBar := createStaticProgressBar(elapsed, totalDuration)
 
 				// Get system resource usage
-				sysStats := getSystemStats()
+				sysStats := getSystemStats(tcpMonitor)
 				procMemMB := getProcessMemoryMB()
 
 				// Create metrics snapshot and log to CSV
@@ -2142,6 +2364,8 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 						CPUPercent:        sysStats.CPUPercent,
 						ProcessMemoryGB:   procMemMB / 1024,
 						TotalOutBoundConn: sysStats.OutboundTCPConns,
+						ActiveTCPConns:    sysStats.ActiveTCPConns,
+						TCPConnDelta:      sysStats.TCPConnDelta,
 					}
 					stats.CSVLogger.LogMetrics(snapshot)
 				}
@@ -2162,7 +2386,7 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 						"  CPU     : %.0f%%\n"+
 						"  ProcMem : %.1fGB\n"+
 						"  Network : Rx %.1f MB/s | Tx %.1f MB/s\n"+
-						"  TotalOutBoundConn : %d",
+						"  TCP Conns: %d (Δ%+d) | OutBound: %d",
 					progressBar,
 					clientCount,
 					currentTotalQPS, currentWindowGetOps, currentWindowSetOps,
@@ -2172,13 +2396,13 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 					sysStats.CPUPercent,
 					procMemMB/1024,
 					sysStats.NetworkRxMBps, sysStats.NetworkTxMBps,
-					sysStats.OutboundTCPConns,
+					sysStats.ActiveTCPConns, sysStats.TCPConnDelta, sysStats.OutboundTCPConns,
 				)
 
 				fmt.Print(progressLine)
 
 				// Emit CloudWatch metrics
-				cloudwatchConfig.emitCloudWatchMetrics(currentWindowGetOps, currentWindowSetOps, currentTotalQPS, getP99, setP99, sysStats.OutboundTCPConns)
+				cloudwatchConfig.emitCloudWatchMetrics(currentWindowGetOps, currentWindowSetOps, currentTotalQPS, getP99, setP99, sysStats.OutboundTCPConns, sysStats.ActiveTCPConns, sysStats.TCPConnDelta)
 			}
 		}
 	}
@@ -2627,7 +2851,7 @@ func init() {
 	runCmd.Flags().BoolP("random-data", "R", false, "Use random data instead of pattern data")
 
 	// CloudWatch Options
-	runCmd.Flags().Bool("cloudwatch-enabled", true, "Enable CloudWatch metrics emission")
+	runCmd.Flags().Bool("cloudwatch-enabled", false, "Enable CloudWatch metrics emission")
 	runCmd.Flags().String("cloudwatch-region", "us-east-2", "AWS region for CloudWatch metrics")
 	runCmd.Flags().String("cloudwatch-namespace", "MomentoBenchmark", "CloudWatch namespace for metrics")
 }

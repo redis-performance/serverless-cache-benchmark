@@ -625,7 +625,7 @@ func reportPopulateProgress(ctx context.Context, stats *PopulateStats, totalKeys
 				progressBar := createPopulateProgressBar(progress, elapsed)
 
 				// Get system resource usage
-				sysStats := getSystemStats()
+				sysStats := getSystemStats(nil) // No TCP monitor in populate
 				procMemMB := getProcessMemoryMB()
 
 				// Format the progress line with resource monitoring
@@ -677,6 +677,8 @@ func reportPopulateProgress(ctx context.Context, stats *PopulateStats, totalKeys
 						CPUPercent:        sysStats.CPUPercent,
 						ProcessMemoryGB:   procMemMB / 1024,
 						TotalOutBoundConn: sysStats.OutboundTCPConns,
+						ActiveTCPConns:    0, // No TCP monitoring in populate
+						TCPConnDelta:      0, // No TCP monitoring in populate
 					}
 					stats.CSVLogger.LogMetrics(snapshot)
 				}
@@ -715,7 +717,7 @@ func printSystemSummary() {
 	fmt.Printf("\n=== System Resource Summary ===\n")
 
 	// Get current system stats
-	sysStats := getSystemStats()
+	sysStats := getSystemStats(nil) // No TCP monitor in populate
 	procMemMB := getProcessMemoryMB()
 
 	// Get CPU count
