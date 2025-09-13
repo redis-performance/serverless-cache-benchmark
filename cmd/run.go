@@ -112,6 +112,7 @@ type MetricsSnapshot struct {
 	TargetClients     int
 	ActualClients     int
 	FailedConnections int64
+	ReconnectCount    int64
 	TargetQPS         int
 	ActualTotalQPS    float64
 	ActualGetQPS      float64
@@ -150,6 +151,7 @@ type WorkloadStats struct {
 	SetErrors         int64
 	ActiveConnections int64 // Number of active connections
 	FailedConnections int64 // Number of failed connection attempts
+	ReconnectCount    int64 // Number of reconnections performed
 	GetStats          *PerformanceStats
 	SetStats          *PerformanceStats
 	SetupStats        *PerformanceStats // For client setup time measurement
@@ -389,7 +391,7 @@ func NewCSVLogger(filename string) (*CSVLogger, error) {
 
 	// Write CSV header
 	header := []string{
-		"timestamp", "elapsed_seconds", "target_clients", "actual_clients", "failed_connections", "target_qps",
+		"timestamp", "elapsed_seconds", "target_clients", "actual_clients", "failed_connections", "reconnect_count", "target_qps",
 		"actual_total_qps", "actual_get_qps", "actual_set_qps",
 		"total_ops", "get_ops", "set_ops", "get_errors", "set_errors",
 		"get_latency_p50_us", "get_latency_p95_us", "get_latency_p99_us", "get_latency_max_us",
@@ -424,6 +426,7 @@ func (cl *CSVLogger) LogMetrics(snapshot MetricsSnapshot) error {
 		strconv.Itoa(snapshot.TargetClients),
 		strconv.Itoa(snapshot.ActualClients),
 		strconv.FormatInt(snapshot.FailedConnections, 10),
+		strconv.FormatInt(snapshot.ReconnectCount, 10),
 		targetQPSStr,
 		fmt.Sprintf("%.2f", snapshot.ActualTotalQPS),
 		fmt.Sprintf("%.2f", snapshot.ActualGetQPS),
@@ -1846,6 +1849,15 @@ func runWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, wo
 
 	defer wg.Done()
 
+	// Check if reconnection is enabled
+	reconnectIntervalMs, _ := cmd.Flags().GetInt("reconnect-interval")
+	if reconnectIntervalMs > 0 {
+		runWorkerWithReconnection(ctx, workerID, cacheType, cmd, totalKeys, zipfExp,
+			generator, stats, setRatio, getRatio, keyPrefix, keyMin, limiter,
+			timeoutSeconds, measureSetup, verbose, quiet, reconnectIntervalMs)
+		return
+	}
+
 	// Create cache client in this goroutine (parallel connection creation)
 	var client CacheClient
 	var err error
@@ -1877,6 +1889,87 @@ func runWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, wo
 		setRatio, getRatio, keyPrefix, keyMin, limiter, timeoutSeconds, verbose)
 }
 
+// runWorkerWithReconnection runs a worker that periodically reconnects
+func runWorkerWithReconnection(ctx context.Context, workerID int, cacheType string,
+	cmd *cobra.Command, totalKeys int, zipfExp float64, generator *DataGenerator,
+	stats *WorkloadStats, setRatio, getRatio int, keyPrefix string, keyMin int,
+	limiter *rate.Limiter, timeoutSeconds int, measureSetup, verbose, quiet bool,
+	reconnectIntervalMs int) {
+
+	reconnectTicker := time.NewTicker(time.Duration(reconnectIntervalMs) * time.Millisecond)
+	defer reconnectTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Create new connection
+		var client CacheClient
+		var err error
+
+		if measureSetup {
+			client, err = createAndTestCacheClient(ctx, cacheType, cmd, stats)
+		} else {
+			client, err = createCacheClientForRun(ctx, cacheType, cmd)
+		}
+
+		if err != nil {
+			log.Printf("Worker %d: Failed to create client during reconnection: %v", workerID, err)
+			atomic.AddInt64(&stats.FailedConnections, 1)
+			// Wait a bit before retrying
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
+
+		// Track successful connection
+		atomic.AddInt64(&stats.ActiveConnections, 1)
+
+		if verbose && !quiet {
+			log.Printf("Worker %d: Successfully created client connection (reconnect cycle)", workerID)
+		}
+
+		// Run worker for the reconnect interval
+		workerCtx, workerCancel := context.WithTimeout(ctx, time.Duration(reconnectIntervalMs)*time.Millisecond)
+
+		// Run worker in a goroutine so we can handle reconnection timing
+		workerDone := make(chan struct{})
+		go func() {
+			defer close(workerDone)
+			runWorkerInternal(workerCtx, workerID, client, totalKeys, zipfExp, generator, stats,
+				setRatio, getRatio, keyPrefix, keyMin, limiter, timeoutSeconds, verbose)
+		}()
+
+		// Wait for either reconnection time or context cancellation
+		select {
+		case <-ctx.Done():
+			workerCancel()
+			client.Close()
+			atomic.AddInt64(&stats.ActiveConnections, -1)
+			<-workerDone // Wait for worker to finish
+			return
+		case <-reconnectTicker.C:
+			// Time to reconnect
+			workerCancel()
+			client.Close()
+			atomic.AddInt64(&stats.ActiveConnections, -1)
+			<-workerDone // Wait for worker to finish
+
+			if verbose && !quiet {
+				log.Printf("Worker %d: Reconnecting after %d ms", workerID, reconnectIntervalMs)
+			}
+			atomic.AddInt64(&stats.ReconnectCount, 1)
+			// Continue to next iteration to create new connection
+		}
+	}
+}
+
 // runMomentoWorkerWithConnectionCreation creates its own connection and then runs the worker
 func runMomentoWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, workerID int,
 	cacheType string, cmd *cobra.Command, totalKeys int, zipfExp float64,
@@ -1886,7 +1979,14 @@ func runMomentoWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGr
 
 	defer wg.Done()
 
-	// Create cache client in this goroutine (parallel connection creation)
+	// Check if reconnection is enabled
+	reconnectIntervalMs, _ := cmd.Flags().GetInt("reconnect-interval")
+	if reconnectIntervalMs > 0 {
+		runMomentoWorkerWithReconnection(ctx, workerID, cacheType, cmd, totalKeys, zipfExp,
+			generator, stats, workerCount, setRatio, getRatio, keyPrefix, keyMin, limiter,
+			timeoutSeconds, measureSetup, verbose, quiet, reconnectIntervalMs)
+		return
+	}
 
 	// No need for measureSetup ping, just create the cache client as
 	// eager connection already occurs under the hood.
@@ -1907,6 +2007,74 @@ func runMomentoWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGr
 		setRatio, getRatio, keyPrefix, workerCount, keyMin, limiter, timeoutSeconds, verbose)
 }
 
+// runMomentoWorkerWithReconnection runs a Momento worker that periodically reconnects
+func runMomentoWorkerWithReconnection(ctx context.Context, workerID int, cacheType string,
+	cmd *cobra.Command, totalKeys int, zipfExp float64, generator *DataGenerator,
+	stats *WorkloadStats, workerCount int, setRatio, getRatio int, keyPrefix string, keyMin int,
+	limiter *rate.Limiter, timeoutSeconds int, measureSetup, verbose, quiet bool,
+	reconnectIntervalMs int) {
+
+	reconnectTicker := time.NewTicker(time.Duration(reconnectIntervalMs) * time.Millisecond)
+	defer reconnectTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Create new Momento connection
+		client, err := createCacheClientForRun(ctx, cacheType, cmd)
+		if err != nil {
+			log.Printf("Worker %d: Failed to create Momento client during reconnection: %v", workerID, err)
+			// Wait a bit before retrying
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
+
+		if verbose && !quiet {
+			clientConnCount, _ := cmd.Flags().GetUint32("momento-client-conn-count")
+			log.Printf("Worker %d: Successfully created Momento client with %d TCP connections (reconnect cycle)", workerID, clientConnCount)
+		}
+
+		// Run worker for the reconnect interval
+		workerCtx, workerCancel := context.WithTimeout(ctx, time.Duration(reconnectIntervalMs)*time.Millisecond)
+
+		// Run worker in a goroutine so we can handle reconnection timing
+		workerDone := make(chan struct{})
+		go func() {
+			defer close(workerDone)
+			runMomentoWorkerInternal(workerCtx, workerID, client, totalKeys, zipfExp, generator, stats,
+				setRatio, getRatio, keyPrefix, workerCount, keyMin, limiter, timeoutSeconds, verbose)
+		}()
+
+		// Wait for either reconnection time or context cancellation
+		select {
+		case <-ctx.Done():
+			workerCancel()
+			client.Close()
+			<-workerDone // Wait for worker to finish
+			return
+		case <-reconnectTicker.C:
+			// Time to reconnect
+			workerCancel()
+			client.Close()
+			<-workerDone // Wait for worker to finish
+
+			if verbose && !quiet {
+				log.Printf("Worker %d: Reconnecting Momento client after %d ms", workerID, reconnectIntervalMs)
+			}
+			atomic.AddInt64(&stats.ReconnectCount, 1)
+			// Continue to next iteration to create new connection
+		}
+	}
+}
+
 // runRedisWorkerWithConnectionCreation creates its own connection and then runs the worker with multiple workers per client
 func runRedisWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGroup, workerID int,
 	cacheType string, cmd *cobra.Command, totalKeys int, zipfExp float64,
@@ -1915,6 +2083,15 @@ func runRedisWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGrou
 	measureSetup, verbose, quiet bool) {
 
 	defer wg.Done()
+
+	// Check if reconnection is enabled
+	reconnectIntervalMs, _ := cmd.Flags().GetInt("reconnect-interval")
+	if reconnectIntervalMs > 0 {
+		runRedisWorkerWithReconnection(ctx, workerID, cacheType, cmd, totalKeys, zipfExp,
+			generator, stats, workerCount, setRatio, getRatio, keyPrefix, keyMin, limiter,
+			timeoutSeconds, measureSetup, verbose, quiet, reconnectIntervalMs)
+		return
+	}
 
 	// Create cache client in this goroutine (parallel connection creation)
 	var client CacheClient
@@ -1948,6 +2125,88 @@ func runRedisWorkerWithConnectionCreation(ctx context.Context, wg *sync.WaitGrou
 	// Now run the Redis worker routine with multiple workers per client
 	runRedisWorkerInternal(ctx, workerID, client, totalKeys, zipfExp, generator, stats,
 		setRatio, getRatio, keyPrefix, workerCount, keyMin, limiter, timeoutSeconds, verbose)
+}
+
+// runRedisWorkerWithReconnection runs a Redis worker that periodically reconnects
+func runRedisWorkerWithReconnection(ctx context.Context, workerID int, cacheType string,
+	cmd *cobra.Command, totalKeys int, zipfExp float64, generator *DataGenerator,
+	stats *WorkloadStats, workerCount int, setRatio, getRatio int, keyPrefix string, keyMin int,
+	limiter *rate.Limiter, timeoutSeconds int, measureSetup, verbose, quiet bool,
+	reconnectIntervalMs int) {
+
+	reconnectTicker := time.NewTicker(time.Duration(reconnectIntervalMs) * time.Millisecond)
+	defer reconnectTicker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// Create new Redis connection
+		var client CacheClient
+		var err error
+
+		if measureSetup {
+			client, err = createAndTestCacheClient(ctx, cacheType, cmd, stats)
+		} else {
+			client, err = createCacheClientForRun(ctx, cacheType, cmd)
+		}
+
+		if err != nil {
+			log.Printf("Worker %d: Failed to create Redis client during reconnection: %v", workerID, err)
+			atomic.AddInt64(&stats.FailedConnections, 1)
+			// Wait a bit before retrying
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
+
+		// Track successful connection
+		atomic.AddInt64(&stats.ActiveConnections, 1)
+
+		if verbose && !quiet {
+			poolSize, _ := cmd.Flags().GetInt("redis-pool-size")
+			log.Printf("Worker %d: Successfully created Redis client with pool size %d and %d workers (reconnect cycle)", workerID, poolSize, workerCount)
+		}
+
+		// Run worker for the reconnect interval
+		workerCtx, workerCancel := context.WithTimeout(ctx, time.Duration(reconnectIntervalMs)*time.Millisecond)
+
+		// Run worker in a goroutine so we can handle reconnection timing
+		workerDone := make(chan struct{})
+		go func() {
+			defer close(workerDone)
+			runRedisWorkerInternal(workerCtx, workerID, client, totalKeys, zipfExp, generator, stats,
+				setRatio, getRatio, keyPrefix, workerCount, keyMin, limiter, timeoutSeconds, verbose)
+		}()
+
+		// Wait for either reconnection time or context cancellation
+		select {
+		case <-ctx.Done():
+			workerCancel()
+			client.Close()
+			atomic.AddInt64(&stats.ActiveConnections, -1)
+			<-workerDone // Wait for worker to finish
+			return
+		case <-reconnectTicker.C:
+			// Time to reconnect
+			workerCancel()
+			client.Close()
+			atomic.AddInt64(&stats.ActiveConnections, -1)
+			<-workerDone // Wait for worker to finish
+
+			if verbose && !quiet {
+				log.Printf("Worker %d: Reconnecting Redis client after %d ms", workerID, reconnectIntervalMs)
+			}
+			atomic.AddInt64(&stats.ReconnectCount, 1)
+			// Continue to next iteration to create new connection
+		}
+	}
 }
 
 // runRedisWorkerInternal contains the actual Redis worker logic with multiple workers per client
@@ -2095,6 +2354,7 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool, tcp
 	defer ticker.Stop()
 
 	startTime := time.Now()
+	var lastReconnects int64
 
 	for {
 		select {
@@ -2107,6 +2367,7 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool, tcp
 			setOps := atomic.LoadInt64(&stats.SetOps)
 			getErrors := atomic.LoadInt64(&stats.GetErrors)
 			setErrors := atomic.LoadInt64(&stats.SetErrors)
+			reconnects := atomic.LoadInt64(&stats.ReconnectCount)
 
 			totalOps := getOps + setOps
 			elapsed := time.Since(startTime)
@@ -2123,10 +2384,12 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool, tcp
 				getCurrentOps, getP50, getP95, getP99, getMax := stats.GetStats.GetPreviousWindowStats()
 				setCurrentOps, setP50, setP95, setP99, setMax := stats.SetStats.GetPreviousWindowStats()
 
-				// Calculate current metric window AVG QPS
+				// Calculate current metric window AVG QPS and reconnect rate
 				currentWindowGetOps := float64(getCurrentOps / MetricWindowSizeSeconds)
 				currentWindowSetOps := float64(setCurrentOps / MetricWindowSizeSeconds)
 				currentTotalQPS := currentWindowGetOps + currentWindowSetOps
+				reconnectRate := float64(reconnects-lastReconnects) / MetricWindowSizeSeconds
+				lastReconnects = reconnects
 
 				// Get system resource usage
 				sysStats := getSystemStats(tcpMonitor)
@@ -2144,6 +2407,7 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool, tcp
 						TargetClients:     targetClients,
 						ActualClients:     int(activeConns),
 						FailedConnections: failedConns,
+						ReconnectCount:    atomic.LoadInt64(&stats.ReconnectCount),
 						TargetQPS:         targetQPS,
 						ActualTotalQPS:    currentTotalQPS,
 						ActualGetQPS:      currentWindowGetOps,
@@ -2183,7 +2447,7 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool, tcp
 					"\n%s\n"+
 						"Clients : %d\n"+
 						"\n"+
-						"Active conns : %d\tFailed conns : %d\n"+
+						"Active conns : %d\tFailed conns : %d\tReconnects: %d (%.1f/s)\n"+
 						"\n"+
 						"Throughput\n"+
 						"  Ops/s   : Overall: %.0f  |  GET: %.0f/s  |  SET: %.0f/s\n"+
@@ -2202,6 +2466,8 @@ func reportProgress(ctx context.Context, stats *WorkloadStats, verbose bool, tcp
 					currentClients,
 					activeConns,
 					failedConns,
+					reconnects,
+					reconnectRate,
 					currentTotalQPS, currentWindowGetOps, currentWindowSetOps,
 					float64(getP50)/1000.0, float64(getP99)/1000.0,
 					float64(setP50)/1000.0, float64(setP99)/1000.0,
@@ -2293,6 +2559,7 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 
 	startTime := time.Now()
 	totalDuration := time.Duration(testTime) * time.Second
+	var lastReconnects int64
 
 	for {
 		select {
@@ -2305,6 +2572,7 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 			setOps := atomic.LoadInt64(&stats.SetOps)
 			getErrors := atomic.LoadInt64(&stats.GetErrors)
 			setErrors := atomic.LoadInt64(&stats.SetErrors)
+			reconnects := atomic.LoadInt64(&stats.ReconnectCount)
 
 			totalOps := getOps + setOps
 			elapsed := time.Since(startTime)
@@ -2314,10 +2582,12 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 				getCurrentOps, getP50, getP95, getP99, getMax := stats.GetStats.GetPreviousWindowStats()
 				setCurrentOps, setP50, setP95, setP99, setMax := stats.SetStats.GetPreviousWindowStats()
 
-				// Calculate current metric window AVG QPS
+				// Calculate current metric window AVG QPS and reconnect rate
 				currentWindowGetOps := float64(getCurrentOps / MetricWindowSizeSeconds)
 				currentWindowSetOps := float64(setCurrentOps / MetricWindowSizeSeconds)
 				currentTotalQPS := currentWindowGetOps + currentWindowSetOps
+				reconnectRate := float64(reconnects-lastReconnects) / MetricWindowSizeSeconds
+				lastReconnects = reconnects
 
 				// Create progress bar for static workload
 				progressBar := createStaticProgressBar(elapsed, totalDuration)
@@ -2338,6 +2608,7 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 						TargetClients:     clientCount,
 						ActualClients:     int(activeConns),
 						FailedConnections: failedConns,
+						ReconnectCount:    atomic.LoadInt64(&stats.ReconnectCount),
 						TargetQPS:         -1, // Static workload doesn't have target QPS
 						ActualTotalQPS:    currentTotalQPS,
 						ActualGetQPS:      currentWindowGetOps,
@@ -2370,9 +2641,14 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 					stats.CSVLogger.LogMetrics(snapshot)
 				}
 
+				activeConns := atomic.LoadInt64(&stats.ActiveConnections)
+				failedConns := atomic.LoadInt64(&stats.FailedConnections)
+
 				progressLine := fmt.Sprintf(
 					"\n%s\n"+
 						"Clients : %d\n"+
+						"\n"+
+						"Active conns : %d\tFailed conns : %d\tReconnects: %d (%.1f/s)\n"+
 						"\n"+
 						"Throughput\n"+
 						"  Ops/s   : Overall: %.0f  |  GET: %.0f/s  |  SET: %.0f/s\n"+
@@ -2389,6 +2665,10 @@ func reportStaticProgress(ctx context.Context, stats *WorkloadStats, testTime in
 						"  TCP Conns: %d (Δ%+d) | OutBound: %d",
 					progressBar,
 					clientCount,
+					activeConns,
+					failedConns,
+					reconnects,
+					reconnectRate,
 					currentTotalQPS, currentWindowGetOps, currentWindowSetOps,
 					float64(getP50)/1000.0, float64(getP99)/1000.0,
 					float64(setP50)/1000.0, float64(setP99)/1000.0,
@@ -2449,6 +2729,7 @@ func printFinalResults(stats *WorkloadStats, testTime int, measureSetup bool) {
 	setErrors := atomic.LoadInt64(&stats.SetErrors)
 	activeConns := atomic.LoadInt64(&stats.ActiveConnections)
 	failedConns := atomic.LoadInt64(&stats.FailedConnections)
+	reconnects := atomic.LoadInt64(&stats.ReconnectCount)
 
 	totalOps := getOps + setOps
 	totalErrors := getErrors + setErrors
@@ -2462,6 +2743,12 @@ func printFinalResults(stats *WorkloadStats, testTime int, measureSetup bool) {
 	fmt.Printf("Total Errors: %d (%.2f%%)\n", totalErrors, float64(totalErrors)/float64(totalOps)*100)
 	fmt.Printf("Active Connections: %d\n", activeConns)
 	fmt.Printf("Failed Connections: %d\n", failedConns)
+
+	// Reconnection statistics
+	if reconnects > 0 {
+		reconnectRate := float64(reconnects) / float64(testTime)
+		fmt.Printf("Total Reconnects: %d (%.2f/sec avg)\n", reconnects, reconnectRate)
+	}
 	fmt.Println()
 
 	// Client setup statistics (only if measurement was enabled)
@@ -2510,6 +2797,7 @@ func printDynamicFinalResults(stats *WorkloadStats, configs []TrafficConfig, mea
 	setErrors := atomic.LoadInt64(&stats.SetErrors)
 	activeConns := atomic.LoadInt64(&stats.ActiveConnections)
 	failedConns := atomic.LoadInt64(&stats.FailedConnections)
+	reconnects := atomic.LoadInt64(&stats.ReconnectCount)
 
 	totalOps := getOps + setOps
 	totalErrors := getErrors + setErrors
@@ -2522,6 +2810,18 @@ func printDynamicFinalResults(stats *WorkloadStats, configs []TrafficConfig, mea
 	fmt.Printf("Total Errors: %d (%.2f%%)\n", totalErrors, float64(totalErrors)/float64(totalOps)*100)
 	fmt.Printf("Active Connections: %d\n", activeConns)
 	fmt.Printf("Failed Connections: %d\n", failedConns)
+
+	// Calculate total test duration from configs
+	totalDuration := 0
+	for _, config := range configs {
+		totalDuration += config.TimeSeconds
+	}
+
+	// Reconnection statistics
+	if reconnects > 0 && totalDuration > 0 {
+		reconnectRate := float64(reconnects) / float64(totalDuration)
+		fmt.Printf("Total Reconnects: %d (%.2f/sec avg)\n", reconnects, reconnectRate)
+	}
 	fmt.Println()
 
 	// Overall statistics
@@ -2828,6 +3128,7 @@ func init() {
 	runCmd.Flags().Bool("momento-create-cache", true, "Automatically create Momento cache if it doesn't exist")
 	runCmd.Flags().Int("connection-timeout", 180, "Connection timeout in seconds for client creation and ping")
 	runCmd.Flags().Int("connection-delay-ms", 0, "Delay in milliseconds between worker connection attempts (helps with connection storms)")
+	runCmd.Flags().Int("reconnect-interval", 0, "Interval in milliseconds to close and recreate connections (0 = no reconnection)")
 	runCmd.Flags().Uint32("momento-client-conn-count", 1, "Set number of TCP conn each momento client creates")
 	runCmd.Flags().Int("momento-client-worker-count", 1, "Set number of workload generators for each momento client")
 
