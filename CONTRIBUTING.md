@@ -21,13 +21,14 @@ This produces a `serverless-cache-benchmark` binary in the current directory. Go
 
 Types: `feat`, `fix`, `refactor`, `test`, `docs`, `chore`
 
-Example: `feat/add-pipeline-mode`
+Example: `feat/add-cloudwatch-metrics`
 
 ## Coding standards
 
 - Keep changes focused; one logical change per PR.
 - Follow the conventions already present in the codebase (formatting, naming, error handling).
 - No dead code, no commented-out blocks.
+- Run `make checkfmt` (wraps `gofmt`) before pushing; CI will reject unformatted code.
 
 ## Submitting changes
 
@@ -49,6 +50,12 @@ make test
 ```
 
 This command downloads dependencies, builds an instrumented binary, runs all Go tests with coverage enabled, and prints a coverage summary.
+
+Quick smoke-test against a local Redis instance before opening a PR:
+
+```bash
+./serverless-cache-benchmark run --cache-type redis --redis-uri redis://localhost:6379 --clients 4 --test-time 10
+```
 
 ## Review process
 
