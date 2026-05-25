@@ -4,14 +4,14 @@ We treat this repo as "Open Source" within Redis: anyone who clears the bar belo
 
 ## Local setup
 
-<!-- TODO: fill in repo-specific setup steps -->
-
 ```bash
-# Example — replace with actual steps
-git clone git@github.com:redis-performance/<repo>.git
-cd <repo>
-# install dependencies, build, etc.
+git clone git@github.com:redis-performance/serverless-cache-benchmark.git
+cd serverless-cache-benchmark
+go mod download
+make build
 ```
+
+This produces a `serverless-cache-benchmark` binary in the current directory. Go 1.24 or later is required.
 
 ## Branch naming
 
@@ -42,10 +42,16 @@ Example: `feat/add-pipeline-mode`
 - Existing tests must pass: run the test suite locally before opening a PR.
 - Coverage should not decrease.
 
-<!-- TODO: add the exact test command for this repo -->
+Run the full test suite with:
+
+```bash
+make test
+```
+
+This command downloads dependencies, builds an instrumented binary, runs all Go tests with coverage enabled, and prints a coverage summary.
 
 ## Review process
 
 - At least one maintainer approval is required before merge.
 - CI must be green.
-- Maintainers may request changes or close PRs that don't meet the bar — this is normal and not personal.
+- Maintainers may request changes or close PRs that do not meet the bar — this is normal and not personal.
