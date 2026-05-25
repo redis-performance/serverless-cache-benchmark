@@ -27,7 +27,7 @@ For Momento, export `MOMENTO_API_KEY` and pass `--cache-type momento --momento-c
 
 ## Branch naming
 
-Same as human contributors: `<type>/<short-description>` (e.g. `fix/off-by-one-in-pipeline`).
+Same as human contributors: `<type>/<short-description>` (e.g. `fix/zipf-exponent-bounds`).
 
 ## Coding standards
 
@@ -35,6 +35,7 @@ Same as human contributors: `<type>/<short-description>` (e.g. `fix/off-by-one-i
 - Prefer clear, minimal changes over large refactors unless explicitly asked.
 - Do not add comments that describe *what* the code does — only add comments when the *why* is non-obvious.
 - Do not introduce new dependencies without checking with the maintainer.
+- Run `make checkfmt` before committing; CI enforces `gofmt` formatting.
 
 ## Running tests
 
