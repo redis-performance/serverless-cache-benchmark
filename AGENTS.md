@@ -4,17 +4,26 @@ Instructions for AI coding agents (Claude Code, Copilot, Cursor, etc.) working i
 
 ## Project overview
 
-<!-- TODO: one paragraph describing what this repo does -->
+`serverless-cache-benchmark` is a Go CLI tool that benchmarks serverless cache services — primarily Redis-compatible endpoints and Momento — under realistic, configurable workloads. It drives concurrent client connections with Zipf-distributed key access patterns, configurable set/get ratios, and optional traffic-shaping via a CSV file (time_seconds, clients, qps). Results are written to CSV and optionally pushed to AWS CloudWatch. The tool is designed to run on cloud VMs to measure latency and throughput from the application side, making it useful for comparing serverless cache offerings under production-like conditions.
 
 ## Local setup
 
-<!-- TODO: mirror the setup steps from CONTRIBUTING.md -->
+```bash
+git clone git@github.com:redis-performance/serverless-cache-benchmark.git
+cd serverless-cache-benchmark
+go mod download
+make build
+```
+
+This produces a `serverless-cache-benchmark` binary in the current directory. Go 1.24 or later is required.
+
+Quick smoke-test against a local Redis instance:
 
 ```bash
-# Example
-git clone git@github.com:redis-performance/<repo>.git
-cd <repo>
+./serverless-cache-benchmark run --cache-type redis --redis-uri redis://localhost:6379 --clients 4 --test-time 10
 ```
+
+For Momento, export `MOMENTO_API_KEY` and pass `--cache-type momento --momento-cache-name <name>`.
 
 ## Branch naming
 
@@ -29,14 +38,11 @@ Same as human contributors: `<type>/<short-description>` (e.g. `fix/off-by-one-i
 
 ## Running tests
 
-<!-- TODO: exact command to run tests -->
-
 ```bash
-# Example
 make test
 ```
 
-Always run tests before declaring a task complete.
+This downloads dependencies, builds an instrumented binary, runs all Go tests with coverage enabled, and prints a coverage summary. Always run this before declaring a task complete.
 
 ## How to submit changes
 
